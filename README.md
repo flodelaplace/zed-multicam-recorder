@@ -1,4 +1,4 @@
-# ZED Multi-cam quick test
+# ZED Multi-cam Recorder
 
 Test rapide d'enregistrement local SVO sur 4 Jetsons (Seeed reComputer J2021 = Xavier NX 8GB)
 + orchestrateur PC central (Windows + WSL2 Ubuntu).
@@ -91,7 +91,7 @@ maintenant.)
 ## Étape 4 — Orchestrer depuis WSL2
 
 ```bash
-cd /mnt/c/.../zed-quick-test    # adapte au chemin
+cd /mnt/c/.../zed-multicam-recorder    # adapte au chemin
 HOSTS="192.168.1.101 192.168.1.102 192.168.1.103 192.168.1.104"
 
 # Sanity check :
