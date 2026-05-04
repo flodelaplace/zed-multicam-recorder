@@ -42,8 +42,7 @@ L'auteur a déjà deux repos qui font de la **réparation post-hoc** :
 **Ce projet-ci est différent** : on attaque la **racine** du problème en
 remplaçant ZED 360 par un pipeline d'acquisition propre, où chaque Jetson
 enregistre son SVO en LOCAL (pas de streaming) et le PC central ne fait que
-trigger + orchestration. C'est l'architecture qui aurait dû être en place
-dès le début.
+trigger + orchestration.
 
 ## Architecture du pipeline
 
@@ -52,11 +51,11 @@ dès le début.
       └─ orchestrator.py    [TCP client]
                 │
                 ▼
-        Hub / Switch Ethernet
+        Hub / Switch Ethernet (FS PoE)
         /        |       \         \
     Jetson 1  Jetson 2  Jetson 3  Jetson 4
-    (J2021    (Xavier NX, NVMe SSD pour /data)
-     Seeed)
+    (Seeed reComputer J10 = Jetson Nano,
+     JetPack 4.6.1, Python 3.6, eMMC 14 Go)
         │ USB 3.0
         ▼
        ZED2  (un par Jetson)
@@ -66,79 +65,106 @@ Chaque Jetson exécute `zed_recorder.py` qui :
 1. ouvre la ZED2 en mode RGB-only (`DEPTH_MODE.NONE`),
 2. écoute en TCP port 9999,
 3. sur START, lance un thread qui boucle `Camera.grab()` et écrit en SVO
-   (compression H.265 hardware via NVENC),
+   (compression **H.264** hardware via NVENC — voir gotcha plus bas),
 4. enregistre un sidecar `*.timestamps.csv` avec une ligne par frame
    (`frame_idx, hw_ts_ns, mono_ns, dropped_since_prev`),
 5. sur STOP, ferme proprement et renvoie les stats.
 
-Le PC central (`orchestrator.py`) parle aux 4 Jetsons en parallèle via
-`ThreadPoolExecutor`, mesure la dispersion temporelle des STARTs, et pull
-les SVO en SCP en fin de session.
+Le PC central (`orchestrator.py`) parle aux N Jetsons en parallèle via
+`ThreadPoolExecutor`, fait l'analyse réelle des drops via les hw_ts (pas
+via le compteur SDK qui est trompeur), et pull les SVO en SCP.
 
-## État actuel — phase 1 (test 4 cam dans salle AQM)
+## État actuel — phase 1 (validée mai 2026)
 
-Statut : code écrit, jamais lancé sur le matériel réel.
+Pipeline validé end-to-end sur 4 cams en HD1080@30fps, 2 minutes. Vraies pertes
+mesurées 0.03–0.17% par cam (cumulé < 1% sur l'ensemble). Bilan :
 
-Étapes prévues, dans l'ordre :
-
-1. **Découverte réseau** : retrouver les IPs des 4 Jetsons via `nmap -sn`,
-   première connexion SSH, copie de clé publique.
-2. **Doctor** : `jetson_doctor.sh` exécuté sur chaque Jetson pour valider
-   ZED SDK, pyzed, USB 3.x, NVMe monté, espace dispo, time sync.
-3. **Déploiement** : `zed_recorder.py` poussé en SCP sur les 4 Jetsons,
-   lancé manuellement dans 4 sessions SSH (pas encore de systemd).
-4. **Smoke test** : 60 s d'enregistrement orchestré, vérifier 0 drops.
-5. **Test 1h** : la vraie validation. Si zéro drop → architecture validée.
-6. **Industrialisation** (phase 2) : systemd unit, PTP, sync flash LED,
-   déploiement Ansible.
+- ✅ Bootstrap offline fonctionnel (Jetsons sans internet)
+- ✅ ZED SDK 3.8.2 + pyzed installés sur les 4
+- ✅ Calibrations factory récupérées et déployées par cam
+- ✅ Orchestrator config-driven (`config.json`)
+- ⏳ SSD USB par Jetson (en commande) avant validation 1h
+- ⏳ Sync NTP entre Jetsons (horloges actuellement décalées de plusieurs années)
+- ⏳ Rejouage en C++ + systemd à la phase 2
 
 ## Décisions techniques à conserver
 
-- **`DEPTH_MODE.NONE`** systématique au recording : la depth ZED coûte cher
-  en GPU/CPU et n'est pas utilisée en aval. Si quelqu'un te demande de l'activer,
-  questionne d'abord pourquoi — c'est probablement une mauvaise idée pour la
-  reliability du grab loop.
-- **SVO compression H.265** (pas H.264, pas LOSSLESS) : meilleur ratio à
-  qualité visuelle équivalente, encodeur HW NVENC du Xavier NX le supporte
-  nativement.
+- **`DEPTH_MODE.NONE`** systématique : la depth ZED coûte cher en GPU/CPU et
+  n'est pas utilisée en aval. Si quelqu'un te demande de l'activer, questionne
+  d'abord.
+- **SVO compression `H264`** : le **Jetson Nano (T210, NVENC v6) ne fait PAS
+  H.265 hardware**, seul Xavier+ le supporte. Activer H.265 sur Nano fait
+  silencieusement basculer en encode software → CPU saturé, drops massifs.
+  → si on industrialise sur Xavier NX en phase 2, on pourra repasser en H.265.
+- **Extension `.svo`** (pas `.svo2`) : SDK 3.x parle SVO v1, le `.svo2` est
+  pour SDK 4.x+.
 - **TCP JSON line-delimited** plutôt que ZMQ/gRPC : zéro dépendance, débuggable
-  au `nc`, suffisant pour la poignée de commandes (PING / STATUS / START / STOP).
-- **Sidecar CSV par SVO** : c'est notre source de vérité pour analyser les drops
-  en post. Le `dropped_since_prev` vient de `zed.get_frame_dropped_count()` du SDK,
-  qui est plus fiable que de compter les erreurs de `grab()`.
-- **Pas de PTP au début** : on commence par mesurer la dispersion réelle des
-  starts (`spread_ms` dans `cmd_record`). Si <100 ms, NTP suffit. Si pas, on
-  passe à PTP.
-- **Pas de systemd au début** : le recorder se lance à la main pour ce test 1.
-  Une fois validé, on en fait une unité systemd avec `Restart=always`.
+  au `nc`.
+- **Sidecar CSV par SVO** : c'est notre source de vérité pour l'analyse
+  post-hoc. Le `dropped_since_prev` est *recomputé* (delta cumulative) — voir
+  le gotcha sur `get_frame_dropped_count()` plus bas.
+- **`OPENBLAS_CORETYPE=ARMV8`** au top du recorder, AVANT tout import qui
+  charge numpy : sans ça, le wheel manylinux2014_aarch64 de numpy crash en
+  SIGILL sur Cortex-A57. Le recorder le set automatiquement via
+  `os.environ.setdefault`.
+- **Polyfills Python 3.6** : `from __future__ import annotations` et `T | None`
+  ne marchent pas sur Python 3.6 (JetPack 4.6). Utiliser `Optional[T]` et
+  remplacer `time.time_ns()` / `time.monotonic_ns()` par leurs polyfills (cf
+  `zed_recorder.py`).
+- **Drop measurement** : on n'utilise PAS l'orchestrator's `sdk_drops` (le
+  compteur SDK est non corrélé aux pertes réelles). On utilise `analyze`
+  qui compte les intervalles hw_ts > 1.5× la médiane.
 
 ## Cible long terme — 200 patients
 
 Quand on passera à la prod, il faudra ajouter :
 
-- **Sync visuelle hardware** : flash LED piloté par Arduino (USB depuis PC central)
-  visible par les N caméras. Deux flashs (début + fin d'essai) → mesure de la
-  dérive temporelle sur la durée. Ces flashs seront détectés automatiquement
-  dans les SVO en post (saut de luminance), supprimant le besoin de la GUI
-  manuelle de `zed-multicam-sync`.
-- **PTP réel** entre Jetsons (chrony en mode PTP slave, master sur le PC central).
-- **systemd units** pour le recorder, avec restart auto.
+- **Stockage SSD USB** monté sur `/data/recordings` (l'eMMC 14 Go ne tient pas).
+- **Sync visuelle hardware** : flash LED piloté par Arduino visible par les N
+  caméras. Deux flashs (début + fin) → mesure de la dérive temporelle. Détection
+  auto dans les SVO en post (saut de luminance), supprimant le besoin de la
+  GUI manuelle de `zed-multicam-sync`. Alternative validée par Florian : objet
+  qui tombe au sol.
+- **NTP/PTP** entre Jetsons (chrony, master sur le PC central).
+- **systemd unit** pour le recorder, avec `Restart=always`.
 - **Validation auto post-essai** : script qui à la fin de chaque session sort
-  un rapport go/no-go (drops < seuil, dérive < seuil, sujet visible sur toutes
-  les caméras pendant la phase clé).
-- **Métadonnées par session** : ID patient anonymisé, timestamps, version du
-  protocole, calib extrinsèque utilisée. Persistées dans une SQLite ou un CSV
-  versionné, indispensable pour la publication du dataset.
+  un rapport go/no-go.
+- **Métadonnées par session** : ID patient anonymisé, timestamps, version
+  protocole, calib extrinsèque utilisée. Persistées en SQLite ou CSV versionné.
+
+## Layout du projet
+
+```
+zed-multicam-recorder/
+├── README.md                 humain
+├── CLAUDE.md                 toi
+├── config.example.json       template config
+├── config.json               (gitignored typiquement) config réelle
+├── bootstrap.sh              PC : download artifacts + push fleet
+├── install_jetson.sh         Jetson : install offline ZED SDK + deps
+├── jetson_doctor.sh          Jetson : env audit
+├── zed_recorder.py           Jetson : daemon TCP + grab loop
+├── orchestrator.py           PC : fleet CLI (ping, record, analyze, ...)
+├── gui.py                    PC : Tkinter front-end (subprocess orchestrator.py)
+└── artifacts/                (gitignored) téléchargements bootstrap
+```
 
 ## Comment travailler sur ce projet
 
-### Tester côté PC sans Jetson
-
-L'orchestrator est tout en lib standard Python. Tu peux le tester en lançant
-un faux serveur recorder en local :
+### Itérer sur le recorder
 
 ```bash
-# Terminal 1 : faux recorder
+# Modif locale puis push :
+python3 orchestrator.py deploy-recorder --config config.json
+python3 orchestrator.py kill   --config config.json
+python3 orchestrator.py launch --config config.json
+```
+
+### Tester côté PC sans Jetson
+
+`orchestrator.py` est stdlib pure, peut se tester avec un faux serveur :
+
+```bash
 python3 -c "
 import socket, json, threading
 def handle(c):
@@ -150,72 +176,94 @@ s = socket.socket(); s.bind(('127.0.0.1', 9999)); s.listen()
 while True:
     c, _ = s.accept()
     threading.Thread(target=handle, args=(c,), daemon=True).start()
-"
-
-# Terminal 2 :
+" &
 python3 orchestrator.py ping --hosts 127.0.0.1
 ```
 
-### Tester côté Jetson
+### Tester côté Jetson sans cam
 
-Pas de simulateur ZED2 fonctionnel. Il faut une vraie caméra branchée.
-`zed_recorder.py --resolution VGA --fps 15` permet de tourner sur des
-configurations USB plus modestes pour debug.
+Pas de simulateur ZED. Il faut une vraie caméra. `--resolution VGA --fps 15`
+allège pour debug.
 
-### Itérer sur le code
+## Gotchas / pièges connus (TOUS rencontrés sur le terrain)
 
-- `orchestrator.py` se modifie côté WSL2, on relance et c'est bon.
-- `zed_recorder.py` se modifie côté WSL2 puis se redéploie en SCP. Cf.
-  l'alias `zed-deploy` recommandé dans la conversation pré-projet.
-- Sur Jetson, kill de l'ancien recorder via Ctrl-C dans la session SSH puis
-  relance.
+- **`get_frame_dropped_count()` est CUMULATIF**, pas un delta. La doc
+  Stereolabs officielle : *"Returns the number of frames dropped since
+  Grab() was called for the first time."*. Le `zed_recorder.py` calcule
+  donc le delta soi-même (`dropped_cum - last_dropped_cum`) pour le CSV,
+  et stocke la valeur cumulative finale dans `frames_dropped`. Et de
+  toute façon c'est trompeur — le compteur incremente sur des events
+  internes du SDK pas corrélés aux vraies pertes vidéo. **Toujours
+  utiliser `orchestrator.py analyze` pour le vrai métric.**
 
-## Gotchas / pièges connus
+- **Numpy SIGILL sur Nano** : le wheel `manylinux2014_aarch64` utilise
+  un OpenBLAS qui détecte le CPU au runtime et émet des instructions ARM
+  non supportées par Cortex-A57. Fix : `OPENBLAS_CORETYPE=ARMV8` avant
+  `import numpy`. Le recorder le fait. Si tu ajoutes un script Python
+  qui import pyzed/numpy sur le Jetson, n'oublie pas de set ce env var.
 
-- **eMMC vs NVMe** : le Xavier NX a 16 Go d'eMMC interne. Une heure de SVO
-  H.265 = ~20 Go. SI le NVMe n'est pas monté sur `/data`, le recording remplit
-  l'eMMC et plante le Jetson. Le `jetson_doctor.sh` vérifie ce point —
-  c'est CRITIQUE.
-- **USB 2.0 silencieux** : si la ZED2 est branchée sur un port marqué USB 3
-  mais qu'un câble pourri ou un hub USB 2 est entre les deux, elle marche
-  toujours (en mode dégradé) sans erreur explicite. Le doctor check via
-  `lsusb -t` la vitesse négociée (`5000M` = OK, `480M` = FAIL).
-- **`pyzed` pas installé** : le ZED SDK pose les libs C++ mais pas le binding
-  Python par défaut. Il faut lancer `python3 /usr/local/zed/get_python_api.py`
-  une fois après install du SDK.
-- **`get_frame_dropped_count()`** retourne le nombre depuis le DERNIER `grab()`,
-  pas un cumul. Le recorder fait la somme correctement, ne pas casser ça.
-- **Multi-thread + ZED SDK** : le SDK ZED a parfois des soucis avec spawn de
-  processus. On utilise des threads (pas du `ProcessPoolExecutor`) côté
-  recorder. Garder ça en tête si on optimise.
+- **CUDA pas dans PATH** : le doctor et l'installer ZED disent "CUDA
+  detection failed" parce que `nvcc` n'est pas dans `$PATH` par défaut
+  sur JetPack. Mais CUDA est bien là sous `/usr/local/cuda-10.2`. Le
+  runtime ZED SDK le trouve via les libs `.so`, donc pas bloquant.
+
+- **Python 3.6** sur les Nano (JetPack 4.6) : pas de `time.time_ns()`,
+  pas de `from __future__ import annotations`, pas de `T | None`.
+  Voir polyfills dans `zed_recorder.py`.
+
+- **pyzed install échoue offline** : le `get_python_api.py` du SDK fait un
+  `urllib.urlretrieve` qui timeout sans internet. Solution : on
+  pré-télécharge le wheel `pyzed-3.8-cp36-cp36m-linux_aarch64.whl` via
+  bootstrap et on `pip install --user --no-deps`. La dep `Cython` du
+  metadata wheel est fausse (le binaire est précompilé), d'où `--no-deps`.
+
+- **Calibration files** : ZED SDK télécharge `SN<serial>.conf` au
+  premier `Camera.open()` depuis `calib.stereolabs.com`. Sans internet
+  → "CALIBRATION FILE NOT AVAILABLE". Le bootstrap les fetche pour
+  chaque cam connectée et les pose dans `/usr/local/zed/settings/`.
+
+- **USB 2.0 silencieux** : si la ZED2 est branchée sur un port USB 3
+  mais qu'un câble pourri ou hub USB 2 est entre les deux, elle marche
+  toujours en mode dégradé sans erreur. Le doctor check `lsusb -t`
+  (`5000M` = OK, `480M` = FAIL).
+
+- **ZED2 firmware bloqué** : symptôme = `lsusb` voit la cam mais
+  `sl.Camera.get_device_list()` retourne `[]`, ou `Camera.open()` →
+  "CAMERA STREAM FAILED TO START" / "CAMERA MOTION SENSORS NOT DETECTED".
+  Fix physique : débrancher / rebrancher le câble USB côté cam ou Jetson.
+  Si récurrent → reboot le Jetson.
+
+- **eMMC saturée à >80%** : performances chutent (write amplification du
+  controller eMMC). Symptôme = stalls de 1-2 s pendant le record →
+  avg fps qui chute. Solution : SSD USB externe.
+
+- **Multi-thread + ZED SDK** : le SDK a parfois des soucis avec spawn de
+  processus. On utilise des threads (pas `ProcessPoolExecutor`) côté
+  recorder. Garder en tête si on optimise.
+
 - **WSL2 networking** : depuis WSL2, les Jetsons sur le LAN sont accessibles
-  directement (WSL2 a son propre stack réseau qui sort via NAT du Windows host).
-  Pas besoin de port-forwarding. En revanche pour qu'un Jetson appelle WSL2
-  c'est plus chiant (port-forwarding Windows nécessaire) — on évite ce sens.
+  directement (mirrored networking config `.wslconfig`). En revanche pour
+  qu'un Jetson appelle WSL2 c'est plus chiant (port-forwarding Windows
+  nécessaire) — on évite ce sens.
 
-## Fichiers du projet
-
-| Fichier | Lieu d'exécution | Rôle |
-|---|---|---|
-| `README.md` | (humain) | Quick start utilisateur |
-| `CLAUDE.md` | (toi) | Ce fichier |
-| `jetson_doctor.sh` | Jetson | Diagnostic env, à lancer une fois par Jetson |
-| `zed_recorder.py` | Jetson | Service de recording (TCP server + grab loop) |
-| `orchestrator.py` | PC / WSL2 | Contrôleur (ping/status/record/pull/report) |
+- **`pkill -f motif`** matche aussi le bash distant qui contient le motif
+  en argument → on se suicide soi-même. Préférer `ps -C python3 -o pid=,cmd=`
+  + filter, ou `fuser -k <port>/tcp` (cible précise).
 
 ## Conventions de code
 
-- Python 3.6+ compatible (les Jetsons tournent souvent encore sous 3.6/3.8).
-- Type hints quand ça aide la lisibilité, pas de fanatisme.
-- F-strings OK, walrus opérateur déconseillé (compat 3.6).
-- Pas de dépendance externe ajoutée sans bonne raison — on tient en stdlib +
-  `pyzed` côté recorder, stdlib pure côté orchestrator.
-- Logs : `print(..., flush=True)` suffit pour le recorder (capture par systemd
-  plus tard). Pas de `logging` configuré, on peut l'ajouter quand on industrialisera.
+- Python 3.6+ compatible côté recorder. Stdlib seule côté orchestrator
+  (pas de PyYAML / etc., utiliser JSON pour la config).
+- Type hints quand ça aide la lisibilité, pas de fanatisme. Préférer
+  `Optional[T]` à `T | None` (Python 3.6 compat).
+- F-strings OK, walrus déconseillé (compat 3.6).
+- Logs : `print(..., flush=True)` suffit (capture par systemd plus tard).
+- Pas d'emoji dans le code.
 
 ## Ressources externes
 
-- ZED SDK Python API: https://www.stereolabs.com/docs/api/python/
-- `Camera.enable_recording`: https://www.stereolabs.com/docs/api/python/classpyzed_1_1sl_1_1Camera.html
-- ZED SDK on Jetson best practices: https://www.stereolabs.com/docs/installation/jetson
-- Auteur du projet : Florian Delaplace, florian.delaplace@sportfx.ai
+- ZED SDK Python API : https://www.stereolabs.com/docs/api/python/
+- `Camera.enable_recording` : https://www.stereolabs.com/docs/api/python/classpyzed_1_1sl_1_1Camera.html
+- ZED SDK on Jetson : https://www.stereolabs.com/docs/installation/jetson
+- Calibration files par serial : http://calib.stereolabs.com/?SN=<serial>
+- Auteur : Florian Delaplace, florian.delaplace@sportfx.ai

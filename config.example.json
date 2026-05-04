@@ -1,0 +1,31 @@
+{
+  "_comment": "Fleet config for zed-multicam-recorder. Copy to config.json and edit for your setup.",
+
+  "port": 9999,
+  "remote_dir": "/tmp/recordings",
+
+  "default_resolution": "HD1080",
+  "default_fps": 30,
+
+  "openblas_armv8": true,
+
+  "default_ssh_user": "zed",
+
+  "hosts": [
+    { "ip": "192.168.0.2", "user": "zed1",  "label": "cam_left"  },
+    { "ip": "192.168.0.3", "user": "zed",   "label": "cam_back_left"  },
+    { "ip": "192.168.0.4", "user": "zed",   "label": "cam_back_right" },
+    { "ip": "192.168.0.6", "user": "zed",   "label": "cam_right"  }
+  ],
+
+  "_explanations": {
+    "port": "TCP port that each recorder listens on. Must match zed_recorder.py --port.",
+    "remote_dir": "Path on each Jetson where SVOs and sidecar CSVs land. Must be writable by the SSH user. /tmp is fine for tests but cleared on reboot — use /home/<user>/recordings or an SSD mount for production.",
+    "default_resolution": "ZED2 supports HD2K (15 fps max), HD1080 (30 fps), HD720 (60 fps), VGA (100 fps).",
+    "default_fps": "Capped by the resolution choice above.",
+    "openblas_armv8": "Set to true for Jetson Nano (Cortex-A57 cannot run modern numpy BLAS dispatch). Set to false on Xavier NX or Orin where it is not needed.",
+    "default_ssh_user": "Used when --hosts overrides config, or when a host entry omits 'user'.",
+    "hosts.user": "Per-Jetson SSH login. Often differs across machines if they were flashed by different people.",
+    "hosts.label": "Friendly identifier used in output tables and pull subdirectory names. Must be unique across hosts."
+  }
+}

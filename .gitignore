@@ -19,6 +19,12 @@ svo/
 # Doctor logs
 doctor_*.log
 
+# Bootstrap artifacts (downloaded by bootstrap.sh)
+artifacts/
+
+# Site-specific fleet config (keep config.example.json)
+config.json
+
 # OS junk
 .DS_Store
 Thumbs.db

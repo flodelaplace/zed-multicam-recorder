@@ -24,22 +24,39 @@ and inter-frame jitter can be analysed in post.
 Usage on Jetson :
     python3 zed_recorder.py --output-dir /data/recordings --resolution HD1080 --fps 30
 """
-from __future__ import annotations
+import os
+# Force OpenBLAS generic ARMv8 dispatch — without this, numpy on Jetson Nano
+# (Cortex-A57) raises SIGILL because the bundled BLAS uses instructions the
+# CPU does not support. Must be set before any numpy/pyzed import.
+os.environ.setdefault("OPENBLAS_CORETYPE", "ARMV8")
 
 import argparse
 import datetime as dt
 import json
-import os
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import pyzed.sl as sl
 
 DEFAULT_PORT = 9999
 DEFAULT_OUTPUT_DIR = "/data/recordings"
+
+
+# _time_ns() and _monotonic_ns() were added in Python 3.7. Jetsons run
+# JetPack 4.6 with Python 3.6, so polyfill from float seconds.
+if hasattr(time, "time_ns"):
+    _time_ns = time.time_ns
+    _monotonic_ns = time.monotonic_ns
+else:
+    def _time_ns():
+        return int(time.time() * 1_000_000_000)
+
+    def _monotonic_ns():
+        return int(time.monotonic() * 1_000_000_000)
 
 
 # ---------- Recorder ---------- #
@@ -53,10 +70,10 @@ class Recorder:
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self.zed: sl.Camera | None = None
-        self.state: str = "idle"   # idle | opening | recording | stopping
-        self.current: dict = {}
+        self._thread = None  # type: Optional[threading.Thread]
+        self.zed = None  # type: Optional[sl.Camera]
+        self.state = "idle"   # idle | opening | recording | stopping
+        self.current = {}  # type: dict
 
     # -- camera open helper ---------------------------------------------------
     def _open_camera(self) -> sl.Camera:
@@ -86,9 +103,13 @@ class Recorder:
             serial = info.serial_number
             ts = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
             base = f"{label}_{serial}_{ts}"
-            svo_path = self.output_dir / f"{base}.svo2"
+            # SDK 3.x uses .svo (SVO v1). The .svo2 format is SDK 4.x+.
+            svo_path = self.output_dir / f"{base}.svo"
 
-            rec = sl.RecordingParameters(str(svo_path), sl.SVO_COMPRESSION_MODE.H265)
+            # H.264 hardware NVENC on Jetson Nano (Cortex-A57). H.265 NVENC
+            # is Xavier+ only — choosing it here would silently fall back to
+            # software encoding and cripple the grab loop.
+            rec = sl.RecordingParameters(str(svo_path), sl.SVO_COMPRESSION_MODE.H264)
             err = zed.enable_recording(rec)
             if err != sl.ERROR_CODE.SUCCESS:
                 zed.close()
@@ -105,8 +126,8 @@ class Recorder:
                 "label": label,
                 "resolution": self.resolution,
                 "fps": self.fps,
-                "start_unix_ns": time.time_ns(),
-                "start_monotonic_ns": time.monotonic_ns(),
+                "start_unix_ns": _time_ns(),
+                "start_monotonic_ns": _monotonic_ns(),
                 "duration_s": duration_s,
                 "frames_grabbed": 0,
                 "frames_dropped": 0,
@@ -152,6 +173,9 @@ class Recorder:
         deadline = time.monotonic() + duration_s if duration_s > 0 else float("inf")
 
         csv_path = Path(self.current["csv"])
+        # Stereolabs get_frame_dropped_count() is CUMULATIVE since first grab,
+        # not per-grab. Track previous cumulative value to derive per-frame delta.
+        last_dropped_cum = 0
         try:
             with open(csv_path, "w", buffering=1) as f:
                 f.write("frame_idx,hw_ts_ns,mono_ns,dropped_since_prev\n")
@@ -164,17 +188,19 @@ class Recorder:
                         except Exception:
                             hw_ts = 0
                         try:
-                            dropped = int(self.zed.get_frame_dropped_count())
+                            dropped_cum = int(self.zed.get_frame_dropped_count())
                         except Exception:
-                            dropped = 0
-                        mono = time.monotonic_ns()
-                        f.write(f"{idx},{hw_ts},{mono},{dropped}\n")
+                            dropped_cum = last_dropped_cum
+                        dropped_delta = dropped_cum - last_dropped_cum
+                        last_dropped_cum = dropped_cum
+                        mono = _monotonic_ns()
+                        f.write(f"{idx},{hw_ts},{mono},{dropped_delta}\n")
                         self.current["frames_grabbed"] = idx + 1
-                        self.current["frames_dropped"] += dropped
+                        self.current["frames_dropped"] = dropped_cum  # cumulative, not summed
                         idx += 1
                     else:
                         # grab error : log a row with idx=-1 so we keep a temporal trace
-                        f.write(f"-1,0,{time.monotonic_ns()},{err}\n")
+                        f.write(f"-1,0,{_monotonic_ns()},{err}\n")
                         # Brief pause to avoid tight error loop
                         time.sleep(0.001)
         finally:
@@ -191,7 +217,7 @@ class Recorder:
             except Exception:
                 pass
             self.zed = None
-        self.current["end_unix_ns"] = time.time_ns()
+        self.current["end_unix_ns"] = _time_ns()
         with self._lock:
             self.state = "idle"
 
