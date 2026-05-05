@@ -233,6 +233,17 @@ class Recorder:
                 pass
             self.zed = None
         self.current["end_unix_ns"] = _time_ns()
+        # Persist stats next to the SVO so post-processing tools (analyze,
+        # playback) can read first_frame_unix_ns, the per-cam camera_open
+        # latency, and final frame counts without going through the
+        # orchestrator.
+        try:
+            stats_path = Path(self.current["filename"]).with_suffix(".stats.json")
+            with open(stats_path, "w") as f:
+                json.dump(self.current, f, indent=2, default=str)
+        except Exception as exc:
+            print(f"[zed_recorder] failed to write stats sidecar: {exc}",
+                  flush=True)
         with self._lock:
             self.state = "idle"
 

@@ -19,6 +19,7 @@ scientifically-reproducible capture path for markerless biomechanics.
 | `zed_recorder.py` | Jetson | TCP daemon + grab/record loop |
 | `orchestrator.py` | PC | Fleet CLI: ping, record, pull, analyze, etc. |
 | `gui.py` | PC | Tkinter GUI wrapper around the orchestrator |
+| `playback.py` | PC | Mosaic playback synchronised by wall-clock |
 | `config.example.json` | — | Sample fleet config |
 
 ## Hardware assumptions
@@ -198,12 +199,19 @@ You should see `ok` from all hosts and one camera per host listed.
 python3 orchestrator.py record --config config.json \
     --duration 60 --label patient_001
 
-# Bring SVOs + sidecar CSVs back to ./svo on the PC:
+# (optional, only if you want to play the videos on the PC) convert each
+# remote SVO to MP4 via pyzed on its Jetson — takes about real-time per cam:
+python3 orchestrator.py convert-mp4 --config config.json
+
+# Bring SVOs (+ MP4s if converted) + sidecar CSVs + stats.json back :
 python3 orchestrator.py pull --config config.json --local-dir ./svo
 
-# Compute REAL frame loss / fps from sidecar CSVs (uses hw_ts deltas, not the
-# misleading SDK get_frame_dropped_count() metric):
+# Compute REAL frame loss / fps per cam from sidecar CSVs (hw_ts deltas) :
 python3 orchestrator.py analyze --local-dir ./svo
+
+# Wall-clock-synchronised mosaic playback (needs the .mp4s — i.e. you ran
+# convert-mp4 before pull). Press SPACE / q / . / , / s to control :
+python3 playback.py ./svo
 
 # Free up Jetson disk after pulling:
 python3 orchestrator.py clean --config config.json --yes
@@ -234,7 +242,7 @@ Layout :
 - *Fleet* table showing the configured hosts
 - *Daemons* row : resolution + fps pickers, Launch / **Restart** / Kill / Ping / List cams / Status
 - *Record* row : duration + label + Record button
-- *After recording* row : local dir, Pull / Analyze / Clean buttons
+- *After recording* row : local dir, **Convert MP4** / Pull / Analyze / **Play sync** / Clean buttons
 - *Output* log
 
 ## Subcommand reference
@@ -257,6 +265,9 @@ python3 orchestrator.py --config config.json <SUBCOMMAND>
                    --duration   seconds (0 = until ENTER)
                    --label      filename prefix
                    --force      proceed even if some hosts unreachable
+  convert-mp4      Convert each remote SVO to MP4 (left cam) on its Jetson
+                   via pyzed. Output sits next to the SVO so the next `pull`
+                   brings everything together. ~1× realtime per camera.
   pull             SCP recordings back to local dir
                    --local-dir  default ./svo
   clean            Delete remote recordings to free Jetson disk
@@ -288,6 +299,32 @@ sampling. HD2K loses temporal info; HD720 loses spatial detail per joint.
 Storage cost at HD1080 + H.264 hardware: ~24 Mbps ≈ **10 GB/h per camera**.
 Plan SSDs accordingly (the eMMC of a Jetson Nano holds maybe 30 minutes of
 4-cam recording).
+
+## Visualising the sync (`playback.py`)
+
+`playback.py` is a small standalone tool (cv2 only, no ZED SDK on the PC)
+that plays N synchronised videos as a mosaic, aligned by wall-clock.
+
+Workflow :
+
+```bash
+# 1. Record + convert + pull (on the PC, with daemons running) :
+python3 orchestrator.py record       --config config.json --duration 30 --label sync_test
+python3 orchestrator.py convert-mp4  --config config.json
+python3 orchestrator.py pull         --config config.json --local-dir ./svo
+
+# 2. Play :
+python3 playback.py ./svo
+```
+
+Each cam pane is annotated with `f<index>  +<ms>` showing the wall-clock
+offset of that frame from the global start. With NTP-synced clocks all
+panes should advance together (within ±16.5 ms = half a frame at 30 fps).
+
+Controls : `SPACE` pause/resume, `q` quit, `.` step forward, `,` step
+backward, `s` print per-cam wall-clock spread for the current cursor (the
+key debug metric : if `s` prints e.g. 4.2 ms, all four cams are
+*frame-aligned* despite having started 478 ms apart).
 
 ## Synchronisation metrics
 

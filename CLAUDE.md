@@ -150,8 +150,10 @@ zed-multicam-recorder/
 ├── setup_ntp.sh              PC : chrony serveur + Jetsons systemd-timesyncd
 ├── jetson_doctor.sh          Jetson : env audit
 ├── zed_recorder.py           Jetson : daemon TCP + grab loop
-├── orchestrator.py           PC : fleet CLI (ping, record, restart, analyze, ...)
+├── orchestrator.py           PC : fleet CLI (ping, record, restart, analyze,
+│                                  convert-mp4, ...)
 ├── gui.py                    PC : Tkinter front-end (subprocess orchestrator.py)
+├── playback.py               PC : mosaïque sync wall-clock (cv2 only, pas de SDK)
 └── artifacts/                (gitignored) téléchargements bootstrap
 ```
 

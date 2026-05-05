@@ -447,6 +447,98 @@ def cmd_deploy_recorder(args, cfg):
     return 0 if failures == 0 else 1
 
 
+# Inline pyzed converter that turns each remote .svo into a .mp4 (left cam
+# only) using cv2.VideoWriter. Runs on the Jetson; that's where pyzed lives.
+_REMOTE_CONVERT_PY = r"""
+import os, sys, glob
+os.environ.setdefault("OPENBLAS_CORETYPE", "ARMV8")
+import pyzed.sl as sl
+import cv2
+
+REMOTE_DIR = sys.argv[1]
+
+svos = sorted(glob.glob(os.path.join(REMOTE_DIR, "*.svo")))
+if not svos:
+    print("no svo found in", REMOTE_DIR); sys.exit(0)
+
+for svo in svos:
+    mp4 = os.path.splitext(svo)[0] + ".mp4"
+    if os.path.exists(mp4) and os.path.getmtime(mp4) >= os.path.getmtime(svo):
+        print("skip (mp4 up to date):", os.path.basename(mp4))
+        continue
+    print("convert ->", os.path.basename(mp4))
+    zed = sl.Camera()
+    init = sl.InitParameters()
+    init.set_from_svo_file(svo)
+    init.svo_real_time_mode = False
+    init.depth_mode = sl.DEPTH_MODE.NONE
+    err = zed.open(init)
+    if err != sl.ERROR_CODE.SUCCESS:
+        print("  open failed:", err); continue
+    info = zed.get_camera_information()
+    res = info.camera_resolution
+    fps = info.camera_fps
+    img = sl.Mat()
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(mp4, fourcc, float(fps), (res.width, res.height))
+    n = 0
+    while True:
+        e = zed.grab()
+        if e == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
+            break
+        if e != sl.ERROR_CODE.SUCCESS:
+            continue
+        zed.retrieve_image(img, sl.VIEW.LEFT)
+        bgra = img.get_data()
+        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+        out.write(bgr)
+        n += 1
+    out.release()
+    zed.close()
+    print("  wrote", n, "frames")
+print("done")
+"""
+
+
+def cmd_convert_mp4(args, cfg):
+    """SVO -> MP4 conversion via pyzed on each Jetson, in-place in remote_dir.
+
+    The .mp4 sits next to its .svo so that subsequent `pull` brings everything
+    back together. Lossy re-encode on Jetson Nano takes ~real-time per camera
+    (so 2 min recording = 2 min conversion)."""
+    hosts = resolve_hosts(args, cfg)
+    print(f"[convert-mp4] running pyzed converter on {len(hosts)} hosts in parallel")
+    print("  (each conversion ~ real-time per camera duration)")
+
+    def _one(host):
+        target = f"{host['user']}@{host['ip']}"
+        cmd = ("python3 -c '" + _REMOTE_CONVERT_PY.replace("'", "'\\''")
+               + "' " + cfg["remote_dir"])
+        result = subprocess.run(["ssh", *SSH_OPTS, target, cmd],
+                                capture_output=True, text=True)
+        return host, result
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        futs = {ex.submit(_one, h): h for h in hosts}
+        for fut in as_completed(futs):
+            host, result = fut.result()
+            results[host["ip"]] = result
+
+    for h in hosts:
+        ip = h["ip"]
+        r = results.get(ip)
+        marker = "OK " if r and r.returncode == 0 else "ERR"
+        print(f"  {marker}  {ip:15}  {h['label']}")
+        if r and r.stdout:
+            for line in r.stdout.strip().splitlines():
+                print(f"        {line}")
+        if r and r.returncode != 0 and r.stderr:
+            for line in r.stderr.strip().splitlines()[-5:]:
+                print(f"        ERR: {line}")
+    return 0
+
+
 def cmd_restart(args, cfg):
     """Redeploy zed_recorder.py and (re)start the daemon on each host.
 
@@ -523,6 +615,11 @@ def main(argv=None):
 
     sp = sub.add_parser("deploy-recorder", help="Push zed_recorder.py to each host")
     sp.set_defaults(func=cmd_deploy_recorder)
+
+    sp = sub.add_parser("convert-mp4",
+                        help="Convert each SVO on each Jetson to MP4 (left cam) "
+                             "via pyzed, ready for download by `pull`")
+    sp.set_defaults(func=cmd_convert_mp4)
 
     sp = sub.add_parser("restart",
                         help="Redeploy zed_recorder.py + (re)start daemon on each host "

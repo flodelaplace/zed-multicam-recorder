@@ -108,14 +108,18 @@ class App:
         ttk.Entry(post, textvariable=self.local_dir_var, width=30).grid(row=0, column=1, padx=4)
         ttk.Button(post, text="...",
                    command=self._pick_local_dir).grid(row=0, column=2)
+        ttk.Button(post, text="Convert MP4 (remote)",
+                   command=lambda: self._run("convert-mp4")).grid(row=0, column=3, padx=4)
         ttk.Button(post, text="Pull",
                    command=lambda: self._run("pull", "--local-dir", self.local_dir_var.get())
-                   ).grid(row=0, column=3, padx=4)
+                   ).grid(row=0, column=4, padx=4)
         ttk.Button(post, text="Analyze",
                    command=lambda: self._run("analyze", "--local-dir", self.local_dir_var.get())
-                   ).grid(row=0, column=4, padx=4)
+                   ).grid(row=0, column=5, padx=4)
+        ttk.Button(post, text="Play sync",
+                   command=self._play_sync).grid(row=0, column=6, padx=4)
         ttk.Button(post, text="Clean remote",
-                   command=self._clean).grid(row=0, column=5, padx=4)
+                   command=self._clean).grid(row=0, column=7, padx=4)
 
         # Log area
         log_frame = ttk.LabelFrame(self.root, text="Output", padding=4)
@@ -186,6 +190,17 @@ class App:
         if messagebox.askyesno("Confirm",
                                "Delete all remote recordings on every host?"):
             self._run("clean", "--yes")
+
+    def _play_sync(self):
+        """Launch playback.py in a separate process so the GUI stays responsive
+        while the cv2 window is up."""
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("Busy", "A command is already running. Wait for it to finish.")
+            return
+        cmd = [sys.executable, str(HERE / "playback.py"), self.local_dir_var.get()]
+        self._log(f"\n$ {' '.join(cmd)}\n")
+        self.status_var.set("running: playback")
+        threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
 
     def _run(self, *subcmd):
         if self.proc and self.proc.poll() is None:
