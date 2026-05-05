@@ -14,6 +14,7 @@ scientifically-reproducible capture path for markerless biomechanics.
 |---|---|---|
 | `bootstrap.sh` | PC | One-shot: download artifacts and push to all Jetsons |
 | `install_jetson.sh` | Jetson (via SSH after bootstrap) | Install ZED SDK + Python deps offline |
+| `setup_ntp.sh` | PC | Configure PC as NTP server + Jetsons as clients |
 | `jetson_doctor.sh` | Jetson | Validate ZED SDK + USB + storage + clock |
 | `zed_recorder.py` | Jetson | TCP daemon + grab/record loop |
 | `orchestrator.py` | PC | Fleet CLI: ping, record, pull, analyze, etc. |
@@ -111,7 +112,75 @@ Two warnings are expected and harmless:
   download the `pyzed` wheel from the internet; we already pre-installed it
   manually, so this failure is expected.
 
-### 6 · Validate
+### 6 · NTP synchronisation (recommended)
+
+Without NTP, the wall-clock time on each Jetson drifts independently (we've
+seen Jetsons whose dates differed by years). That makes it impossible to
+measure the real inter-camera start delay. With NTP, the Jetsons' clocks are
+kept within ~10 ms of the PC's, and the orchestrator's `First-frame spread
+across cams` becomes a meaningful sync metric.
+
+#### 6a · Windows / WSL2 prereqs (skip on native Linux)
+
+WSL2 mirrored networking shares ports with the Windows host. Two things
+prevent chrony from serving NTP until handled :
+
+1. **`w32time` Windows service holds UDP 123.** Stop it.
+2. **Windows Defender Firewall blocks inbound UDP 123.** Add a rule.
+
+From PowerShell **as administrator** :
+
+```powershell
+Stop-Service w32time
+New-NetFirewallRule -DisplayName "WSL2 chrony NTP" `
+    -Direction Inbound -Protocol UDP -LocalPort 123 `
+    -Action Allow -Profile Any
+```
+
+Optional, to make the `w32time` stop persistent across Windows reboots :
+
+```powershell
+Set-Service -Name w32time -StartupType Disabled
+```
+
+The firewall rule survives reboots automatically.
+
+#### 6b · Run the setup
+
+```bash
+bash setup_ntp.sh
+```
+
+The script :
+- detects the LAN-side PC IP from the first host in `config.json`,
+- installs `chrony` on the PC and writes a server config that uses
+  `pool.ntp.org` (when reachable) and the Hyper-V hardware clock `PHC0`
+  (when on WSL2) as upstream sources,
+- configures each Jetson's `systemd-timesyncd` to sync to the PC,
+- verifies that every Jetson reports `System clock synchronized: yes`.
+
+After ~30 seconds the Jetsons' wall-clocks line up.
+
+#### 6c · Verification
+
+```bash
+python3 orchestrator.py --config config.json record \
+    --duration 10 --label sync_check
+```
+
+In the output, look for the line :
+
+```
+First-frame spread across cams : XYZ ms
+```
+
+A few hundred ms is normal — most of it is variance in `Camera.open()`
+warm-up time, not a clock issue. What matters is that the number is now
+finite-and-meaningful instead of "50 sec, ignore". Each frame in the
+sidecar CSV has a wall-clock timestamp comparable across cameras, which
+is what downstream tools need to align frames in post.
+
+### 7 · Validate
 
 ```bash
 python3 orchestrator.py doctor    --config config.json   # full env audit
@@ -163,7 +232,7 @@ log area at the bottom.
 Layout :
 - *Config* row to load any `config.json`
 - *Fleet* table showing the configured hosts
-- *Daemons* row : resolution + fps pickers, Launch / Kill / Ping / List cams / Status
+- *Daemons* row : resolution + fps pickers, Launch / **Restart** / Kill / Ping / List cams / Status
 - *Record* row : duration + label + Record button
 - *After recording* row : local dir, Pull / Analyze / Clean buttons
 - *Output* log
@@ -180,6 +249,9 @@ python3 orchestrator.py --config config.json <SUBCOMMAND>
                    --resolution {HD2K, HD1080, HD720, VGA}
                    --fps        {15, 30, 60, 100}    (resolution-dependent)
                    --wait       seconds to wait for bind (default 4)
+  restart          Redeploy zed_recorder.py + (re)start daemon on each host
+                   (use after a Jetson reboot or /tmp wipe — equivalent to
+                    `deploy-recorder` then `launch`)
   kill             Stop recorders on each host
   record           Trigger synchronized recording on all hosts
                    --duration   seconds (0 = until ENTER)
@@ -216,6 +288,25 @@ sampling. HD2K loses temporal info; HD720 loses spatial detail per joint.
 Storage cost at HD1080 + H.264 hardware: ~24 Mbps ≈ **10 GB/h per camera**.
 Plan SSDs accordingly (the eMMC of a Jetson Nano holds maybe 30 minutes of
 4-cam recording).
+
+## Synchronisation metrics
+
+After every `record`, the orchestrator prints two numbers per camera :
+
+- `start->1st_frame=X ms` — how long this cam took between receiving the
+  START command and capturing its first frame. Computed inside the Jetson
+  (no clock comparison) so meaningful even without NTP. Typical values on
+  Jetson Nano + ZED2 in HD1080@30fps are 15–30 ms (camera open + sensor
+  warm-up).
+
+- `First-frame spread across cams` — wall-clock difference between the cam
+  that was first ready and the one that was last ready. **Only meaningful
+  with NTP** (see step 6 above). Once NTP-synced, this is the real
+  inter-camera start offset (a few tens of ms typically).
+
+Without genlock hardware, these tens of ms cannot be eliminated. They can
+however be measured, reported, and applied as a per-cam time offset in
+post-processing.
 
 ## Why "real_misses" instead of "drops"
 
@@ -254,6 +345,20 @@ SVO and is the metric you care about for biomechanics post-processing.
   your shell.
 - **`module 'time' has no attribute 'time_ns'`** → you're on Python 3.6 and
   trying to run code that wasn't polyfilled. Our `zed_recorder.py` handles it.
+- **NTP `Could not open NTP socket on 0.0.0.0:123` on WSL2** → Windows
+  `w32time` is holding port 123. Run `Stop-Service w32time` from
+  PowerShell admin (see step 6a).
+- **Jetson `Timed out waiting for reply from 192.168.0.X:123`** → Windows
+  Defender Firewall blocks inbound UDP 123. Add the firewall rule in
+  step 6a.
+- **Jetsons keep `System clock synchronized: no` after `setup_ntp.sh`** →
+  inspect `journalctl -u systemd-timesyncd -n 20` on the Jetson. If it
+  shows "Timed out", the PC chrony isn't reachable on UDP 123 (firewall,
+  port not bound). Re-check `sudo ss -ulnp | grep chrony` on the PC.
+- **Daemons stopped pinging after a Jetson reboot** → `/tmp` was wiped, so
+  `zed_recorder.py` is gone too. Hit the **Restart (redeploy)** button in
+  the GUI, or run `python3 orchestrator.py restart`. For phase 2 we'll
+  move the recorder to a non-volatile path + systemd unit.
 
 ## Project context
 

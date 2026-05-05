@@ -296,19 +296,39 @@ def cmd_record(args, cfg):
     print("[4/4] Sending STOP and collecting stats ...")
     stops = parallel(hosts, cfg["port"], {"cmd": "STOP"}, timeout=30)
     print()
-    print("RESULTS  (note: 'sdk_drops' is the SDK's get_frame_dropped_count(), an")
-    print("  unreliable indicator. Run `analyze` after pull for real frame loss.)")
-    print("-" * 90)
+    print("RESULTS  (note: 'sdk_drops' = SDK's get_frame_dropped_count(),")
+    print("  unreliable. Run `analyze` after pull for real frame loss.)")
+    print("-" * 96)
     for h in hosts:
         ip = h["ip"]
         r = stops.get(ip, {})
         s = r.get("stats", {})
         grabbed = s.get("frames_grabbed", "?")
         sdk_drops = s.get("frames_dropped", "?")
+        delay = s.get("start_to_first_frame_ms")
+        delay_s = f"{delay} ms" if delay is not None else "?"
         fname = s.get("filename", "?")
-        print(f"  {ip:15}  {h['label']:20}  grabbed={grabbed}  sdk_drops={sdk_drops}")
+        print(f"  {ip:15}  {h['label']:20}  grabbed={grabbed}  "
+              f"sdk_drops={sdk_drops}  start->1st_frame={delay_s}")
         print(f"                                            {fname}")
-    print("-" * 90)
+    print("-" * 96)
+
+    # First-frame wall-clock spread across cams (NTP-dependent).
+    # This is the headline sync metric: with NTP-synced Jetsons, it tells
+    # you how much real wall-clock time passed between the cam that was
+    # ready first and the cam that was ready last.
+    first = [s.get("stats", {}).get("first_frame_unix_ns")
+             for s in stops.values()
+             if s.get("ok") and s.get("stats", {}).get("first_frame_unix_ns")]
+    if len(first) >= 2:
+        first_spread_ms = (max(first) - min(first)) / 1e6
+        if first_spread_ms < 5_000:
+            print(f"\nFirst-frame spread across cams : {first_spread_ms:.1f} ms"
+                  f"  (the smaller, the better synchronised the cams are)")
+        else:
+            print(f"\nFirst-frame spread {first_spread_ms:.0f} ms — clocks not")
+            print("  NTP-synchronised, this number is meaningless. Run setup_ntp.sh.")
+
     return 0
 
 
@@ -427,6 +447,23 @@ def cmd_deploy_recorder(args, cfg):
     return 0 if failures == 0 else 1
 
 
+def cmd_restart(args, cfg):
+    """Redeploy zed_recorder.py and (re)start the daemon on each host.
+
+    Useful after a Jetson reboot, /tmp wipe, or whenever pings start failing.
+    Equivalent to: deploy-recorder + launch."""
+    print("[restart 1/2] redeploying zed_recorder.py")
+    cmd_deploy_recorder(args, cfg)
+    print("\n[restart 2/2] launching daemons")
+    if args.resolution is None:
+        args.resolution = cfg["default_resolution"]
+    if args.fps is None:
+        args.fps = cfg["default_fps"]
+    if not hasattr(args, "wait") or args.wait is None:
+        args.wait = 4.0
+    return cmd_launch(args, cfg)
+
+
 # ---------- CLI ---------- #
 
 def main(argv=None):
@@ -486,6 +523,15 @@ def main(argv=None):
 
     sp = sub.add_parser("deploy-recorder", help="Push zed_recorder.py to each host")
     sp.set_defaults(func=cmd_deploy_recorder)
+
+    sp = sub.add_parser("restart",
+                        help="Redeploy zed_recorder.py + (re)start daemon on each host "
+                             "(use after Jetson reboot or /tmp wipe)")
+    sp.add_argument("--resolution", default=None,
+                    choices=["HD2K", "HD1080", "HD720", "VGA"])
+    sp.add_argument("--fps", type=int, default=None, choices=[15, 30, 60, 100])
+    sp.add_argument("--wait", type=float, default=4.0)
+    sp.set_defaults(func=cmd_restart)
 
     args = p.parse_args(argv)
     cfg = load_config(args.config)

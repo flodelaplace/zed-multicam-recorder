@@ -128,6 +128,14 @@ class Recorder:
                 "fps": self.fps,
                 "start_unix_ns": _time_ns(),
                 "start_monotonic_ns": _monotonic_ns(),
+                # Filled in by _record_loop on the first successful grab.
+                # With NTP-synced clocks across Jetsons, comparing
+                # first_frame_unix_ns between cameras gives the real
+                # inter-camera start offset (in wall-clock).
+                "first_frame_unix_ns": None,
+                "first_frame_mono_ns": None,
+                "first_frame_hw_ts_ns": None,
+                "start_to_first_frame_ms": None,
                 "duration_s": duration_s,
                 "frames_grabbed": 0,
                 "frames_dropped": 0,
@@ -194,6 +202,13 @@ class Recorder:
                         dropped_delta = dropped_cum - last_dropped_cum
                         last_dropped_cum = dropped_cum
                         mono = _monotonic_ns()
+                        if idx == 0:
+                            wall = _time_ns()
+                            self.current["first_frame_unix_ns"] = wall
+                            self.current["first_frame_mono_ns"] = mono
+                            self.current["first_frame_hw_ts_ns"] = hw_ts
+                            self.current["start_to_first_frame_ms"] = round(
+                                (wall - self.current["start_unix_ns"]) / 1e6, 3)
                         f.write(f"{idx},{hw_ts},{mono},{dropped_delta}\n")
                         self.current["frames_grabbed"] = idx + 1
                         self.current["frames_dropped"] = dropped_cum  # cumulative, not summed

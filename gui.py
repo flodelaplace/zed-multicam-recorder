@@ -78,14 +78,16 @@ class App:
                      width=5, state="readonly").grid(row=0, column=3, padx=4)
         ttk.Button(daemon, text="Launch daemons",
                    command=self._launch).grid(row=0, column=4, padx=8)
+        ttk.Button(daemon, text="Restart (redeploy)",
+                   command=self._restart).grid(row=0, column=5, padx=2)
         ttk.Button(daemon, text="Kill daemons",
-                   command=lambda: self._run("kill")).grid(row=0, column=5, padx=2)
+                   command=lambda: self._run("kill")).grid(row=0, column=6, padx=2)
         ttk.Button(daemon, text="Ping",
-                   command=lambda: self._run("ping")).grid(row=0, column=6, padx=2)
+                   command=lambda: self._run("ping")).grid(row=0, column=7, padx=2)
         ttk.Button(daemon, text="List cams",
-                   command=lambda: self._run("list-cams")).grid(row=0, column=7, padx=2)
+                   command=lambda: self._run("list-cams")).grid(row=0, column=8, padx=2)
         ttk.Button(daemon, text="Status",
-                   command=lambda: self._run("status")).grid(row=0, column=8, padx=2)
+                   command=lambda: self._run("status")).grid(row=0, column=9, padx=2)
 
         # Record
         rec = ttk.LabelFrame(self.root, text="Record", padding=8)
@@ -162,6 +164,12 @@ class App:
 
     def _launch(self):
         self._run("launch", "--resolution", self.res_var.get(),
+                  "--fps", self.fps_var.get())
+
+    def _restart(self):
+        """Equivalent to deploy-recorder + launch — useful after a Jetson reboot
+        or /tmp wipe, when ping starts returning ConnectionRefused."""
+        self._run("restart", "--resolution", self.res_var.get(),
                   "--fps", self.fps_var.get())
 
     def _record(self):

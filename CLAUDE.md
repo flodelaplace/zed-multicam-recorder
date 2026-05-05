@@ -82,9 +82,14 @@ mesurées 0.03–0.17% par cam (cumulé < 1% sur l'ensemble). Bilan :
 - ✅ Bootstrap offline fonctionnel (Jetsons sans internet)
 - ✅ ZED SDK 3.8.2 + pyzed installés sur les 4
 - ✅ Calibrations factory récupérées et déployées par cam
-- ✅ Orchestrator config-driven (`config.json`)
+- ✅ Orchestrator config-driven (`config.json`) + GUI Tkinter
+- ✅ Recorder rapporte `start_to_first_frame_ms` par cam (latence open+warmup,
+   mesurée intra-Jetson donc valide sans NTP)
+- ✅ NTP via `setup_ntp.sh` — chrony côté PC + systemd-timesyncd côté Jetsons.
+   Une fois actif, le `record` sort un `First-frame spread across cams` qui
+   est le vrai métric de sync (offset wall-clock entre les premières frames
+   capturées par chaque cam).
 - ⏳ SSD USB par Jetson (en commande) avant validation 1h
-- ⏳ Sync NTP entre Jetsons (horloges actuellement décalées de plusieurs années)
 - ⏳ Rejouage en C++ + systemd à la phase 2
 
 ## Décisions techniques à conserver
@@ -142,9 +147,10 @@ zed-multicam-recorder/
 ├── config.json               (gitignored typiquement) config réelle
 ├── bootstrap.sh              PC : download artifacts + push fleet
 ├── install_jetson.sh         Jetson : install offline ZED SDK + deps
+├── setup_ntp.sh              PC : chrony serveur + Jetsons systemd-timesyncd
 ├── jetson_doctor.sh          Jetson : env audit
 ├── zed_recorder.py           Jetson : daemon TCP + grab loop
-├── orchestrator.py           PC : fleet CLI (ping, record, analyze, ...)
+├── orchestrator.py           PC : fleet CLI (ping, record, restart, analyze, ...)
 ├── gui.py                    PC : Tkinter front-end (subprocess orchestrator.py)
 └── artifacts/                (gitignored) téléchargements bootstrap
 ```
@@ -249,6 +255,32 @@ allège pour debug.
 - **`pkill -f motif`** matche aussi le bash distant qui contient le motif
   en argument → on se suicide soi-même. Préférer `ps -C python3 -o pid=,cmd=`
   + filter, ou `fuser -k <port>/tcp` (cible précise).
+
+- **NTP sur WSL2 mirrored = port 123 partagé avec Windows**. Deux pièges
+  rencontrés en mai 2026 :
+  1. **w32time tient UDP 123** : chrony échoue avec "Could not open NTP
+     socket on 0.0.0.0:123". Fix : `Stop-Service w32time` côté PowerShell
+     admin (et `Set-Service w32time -StartupType Disabled` pour persister).
+  2. **Windows Defender Firewall bloque l'UDP 123 entrant** : journal
+     timesyncd des Jetsons dit "Timed out waiting for reply from
+     192.168.0.50:123". Fix : `New-NetFirewallRule ... -LocalPort 123 ...`
+     côté PowerShell admin (rule survit aux reboots).
+  3. **`bindaddress <PC_LAN_IP>`** dans chrony.conf est utile : évite les
+     conflits sur 0.0.0.0:123 et ne change rien côté clients (qui se
+     connectent à l'IP LAN du PC de toute façon).
+  4. **`refclock PHC /dev/ptp0`** dans chrony.conf donne à chrony une
+     référence stratum-1 (le clock Hyper-V) sans avoir besoin d'internet.
+     Sans, chrony tombe en `local stratum 10` qui marche mais c'est moins
+     précis. Sur native Linux sans Hyper-V, /dev/ptp0 n'existe pas et
+     cette ligne est ignorée silencieusement par chrony.
+  Le `setup_ntp.sh` du repo automatise tout côté Linux et imprime les
+  prereqs Windows en début d'exécution si WSL2 détecté.
+
+- **`/tmp` se vide au reboot du Jetson** : zed_recorder.py et
+  /tmp/recordings disparaissent. Solution actuelle : sous-cmd `restart`
+  dans orchestrator (et bouton "Restart (redeploy)" dans la GUI). En
+  phase 2 il faudra poser le recorder à un path persistant
+  (`/usr/local/bin/zed_recorder.py`) avec une unité systemd.
 
 ## Conventions de code
 
