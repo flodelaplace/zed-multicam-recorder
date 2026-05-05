@@ -116,10 +116,12 @@ class App:
         ttk.Button(post, text="Analyze",
                    command=lambda: self._run("analyze", "--local-dir", self.local_dir_var.get())
                    ).grid(row=0, column=5, padx=4)
+        ttk.Button(post, text="Align (sync)",
+                   command=self._align).grid(row=0, column=6, padx=4)
         ttk.Button(post, text="Play sync",
-                   command=self._play_sync).grid(row=0, column=6, padx=4)
+                   command=self._play_sync).grid(row=0, column=7, padx=4)
         ttk.Button(post, text="Clean remote",
-                   command=self._clean).grid(row=0, column=7, padx=4)
+                   command=self._clean).grid(row=0, column=8, padx=4)
 
         # Log area
         log_frame = ttk.LabelFrame(self.root, text="Output", padding=4)
@@ -200,6 +202,17 @@ class App:
         cmd = [sys.executable, str(HERE / "playback.py"), self.local_dir_var.get()]
         self._log(f"\n$ {' '.join(cmd)}\n")
         self.status_var.set("running: playback")
+        threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
+
+    def _align(self):
+        """Run sync_align.py to produce wall-clock-aligned MP4s in ./svo_aligned/."""
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("Busy", "A command is already running. Wait for it to finish.")
+            return
+        cmd = [sys.executable, str(HERE / "sync_align.py"),
+               self.local_dir_var.get()]
+        self._log(f"\n$ {' '.join(cmd)}\n")
+        self.status_var.set("running: align")
         threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
 
     def _run(self, *subcmd):

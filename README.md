@@ -20,6 +20,7 @@ scientifically-reproducible capture path for markerless biomechanics.
 | `orchestrator.py` | PC | Fleet CLI: ping, record, pull, analyze, etc. |
 | `gui.py` | PC | Tkinter GUI wrapper around the orchestrator |
 | `playback.py` | PC | Mosaic playback synchronised by wall-clock |
+| `sync_align.py` | PC | Resample each cam's MP4 to a common wall-clock grid |
 | `config.example.json` | — | Sample fleet config |
 
 ## Hardware assumptions
@@ -213,6 +214,11 @@ python3 orchestrator.py analyze --local-dir ./svo
 # convert-mp4 before pull). Press SPACE / q / . / , / s to control :
 python3 playback.py ./svo
 
+# Or, instead of just viewing, produce aligned MP4s for the biomeca pipeline
+# (one per cam, exactly the same length, wall-clock-aligned, black frames
+# inserted on real gaps with their indices listed in the sidecar JSON):
+python3 sync_align.py ./svo --out-dir ./svo_aligned
+
 # Free up Jetson disk after pulling:
 python3 orchestrator.py clean --config config.json --yes
 
@@ -242,7 +248,7 @@ Layout :
 - *Fleet* table showing the configured hosts
 - *Daemons* row : resolution + fps pickers, Launch / **Restart** / Kill / Ping / List cams / Status
 - *Record* row : duration + label + Record button
-- *After recording* row : local dir, **Convert MP4** / Pull / Analyze / **Play sync** / Clean buttons
+- *After recording* row : local dir, **Convert MP4** / Pull / Analyze / **Align (sync)** / **Play sync** / Clean buttons
 - *Output* log
 
 ## Subcommand reference
@@ -299,6 +305,49 @@ sampling. HD2K loses temporal info; HD720 loses spatial detail per joint.
 Storage cost at HD1080 + H.264 hardware: ~24 Mbps ≈ **10 GB/h per camera**.
 Plan SSDs accordingly (the eMMC of a Jetson Nano holds maybe 30 minutes of
 4-cam recording).
+
+## Aligning for downstream pipelines (`sync_align.py`)
+
+`playback.py` is a viewer ; `sync_align.py` is the production-side tool that
+**writes a new set of MP4s, one per cam, all of the exact same length and
+all on the same wall-clock grid**. Frame `n` of any aligned MP4 corresponds
+to the same instant of real time across cams. Where a source cam had a real
+gap, a black frame is inserted and its index is recorded in the sidecar
+JSON so downstream pose estimators can skip / interpolate it.
+
+This is the equivalent of stages 4–7 of the older
+[zed-multicam-sync](https://github.com/flodelaplace/zed-multicam-sync)
+pipeline, **without the manual visual-event GUI** — NTP plus the recorder's
+`first_frame_unix_ns` give us absolute alignment for free.
+
+Workflow :
+
+```bash
+python3 orchestrator.py record --duration 60 --label patient_001
+python3 orchestrator.py convert-mp4
+python3 orchestrator.py pull --local-dir ./svo
+python3 sync_align.py ./svo --out-dir ./svo_aligned
+```
+
+Output :
+
+```
+svo_aligned/
+  J1/J1.aligned.mp4         exactly N frames @ 30 fps, wall-clock-aligned
+  J1/J1.aligned.json        { t_start_unix_ns, fps, n_frames, black_frames, ... }
+  J2/...
+  J3/...
+  J4/...
+  global.json               cross-cam summary (durations, loss %, etc.)
+```
+
+`black_frames` lists the indices in the aligned MP4 that were synthesised
+because the source cam had a real gap there. Downstream pose pipelines
+should treat them as "no observation" and either skip or interpolate.
+
+CLI options : `--fps` (default 30), `--gap-threshold-ms` (default 0.75 ÷
+fps = 25 ms at 30 fps — frames more than this far from the grid are
+replaced with black instead of stretched).
 
 ## Visualising the sync (`playback.py`)
 

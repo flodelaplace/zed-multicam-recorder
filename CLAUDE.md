@@ -154,6 +154,7 @@ zed-multicam-recorder/
 │                                  convert-mp4, ...)
 ├── gui.py                    PC : Tkinter front-end (subprocess orchestrator.py)
 ├── playback.py               PC : mosaïque sync wall-clock (cv2 only, pas de SDK)
+├── sync_align.py             PC : resampling wall-clock-aligned MP4s pour pipeline biomeca
 └── artifacts/                (gitignored) téléchargements bootstrap
 ```
 
