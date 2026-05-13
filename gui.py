@@ -99,6 +99,7 @@ class App:
         self.label_var = tk.StringVar(value="test")
         ttk.Entry(rec, textvariable=self.label_var, width=24).grid(row=0, column=3, padx=4)
         ttk.Button(rec, text="Record", command=self._record).grid(row=0, column=4, padx=8)
+        ttk.Button(rec, text="Stop record", command=self._stop_record).grid(row=0, column=5, padx=2)
 
         # Post-record
         post = ttk.LabelFrame(self.root, text="After recording", padding=8)
@@ -113,6 +114,8 @@ class App:
         ttk.Button(post, text="Pull",
                    command=lambda: self._run("pull", "--local-dir", self.local_dir_var.get())
                    ).grid(row=0, column=4, padx=4)
+        ttk.Button(post, text="Convert MP4 (local)",
+                   command=self._convert_local).grid(row=1, column=3, padx=4, pady=2)
         ttk.Button(post, text="Analyze",
                    command=lambda: self._run("analyze", "--local-dir", self.local_dir_var.get())
                    ).grid(row=0, column=5, padx=4)
@@ -120,8 +123,10 @@ class App:
                    command=self._align).grid(row=0, column=6, padx=4)
         ttk.Button(post, text="Play sync",
                    command=self._play_sync).grid(row=0, column=7, padx=4)
+        ttk.Button(post, text="Save mosaic",
+                   command=self._save_mosaic).grid(row=0, column=8, padx=4)
         ttk.Button(post, text="Clean remote",
-                   command=self._clean).grid(row=0, column=8, padx=4)
+                   command=self._clean).grid(row=0, column=9, padx=4)
 
         # Log area
         log_frame = ttk.LabelFrame(self.root, text="Output", padding=4)
@@ -163,7 +168,14 @@ class App:
                                  values=(h["ip"],
                                          h.get("label", h["ip"]),
                                          h.get("user", default_user)))
-            self._log(f"Loaded {path} ({len(cfg['hosts'])} hosts)\n")
+            # Reflect the config's default resolution/fps in the GUI dropdowns
+            # so Launch/Restart use those without the user having to re-pick.
+            if hasattr(self, "res_var"):
+                self.res_var.set(cfg.get("default_resolution", "HD1080"))
+            if hasattr(self, "fps_var"):
+                self.fps_var.set(str(cfg.get("default_fps", 30)))
+            self._log(f"Loaded {path} ({len(cfg['hosts'])} hosts, "
+                      f"{cfg.get('default_resolution', '?')}@{cfg.get('default_fps', '?')}fps)\n")
             self.status_var.set(f"config: {path.name} — {len(cfg['hosts'])} hosts")
         except Exception as e:
             messagebox.showerror("Config load failed", str(e))
@@ -188,6 +200,25 @@ class App:
         label = self.label_var.get().strip() or "test"
         self._run("record", "--duration", self.dur_var.get(), "--label", label)
 
+    def _stop_record(self):
+        """Abort an in-progress record. Kills the orchestrator subprocess so
+        it exits its `sleep duration` early, then sends STOP to every recorder
+        so the SVO/CSV/stats sidecar are flushed cleanly. The daemons stay up."""
+        # First kill the local record subprocess if any (gets us out of the
+        # blocking sleep).
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            self._log("\n[stop] killed local record subprocess\n")
+        # Then send STOP to the fleet — fire it as a fresh subprocess so it
+        # runs even if self.proc was just killed.
+        cmd = [sys.executable, str(ORCH), "--config", str(self.config_path), "stop"]
+        self._log(f"$ {' '.join(cmd)}\n")
+        self.status_var.set("stopping recording")
+        threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
+
     def _clean(self):
         if messagebox.askyesno("Confirm",
                                "Delete all remote recordings on every host?"):
@@ -205,14 +236,45 @@ class App:
         threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
 
     def _align(self):
-        """Run sync_align.py to produce wall-clock-aligned MP4s in ./svo_aligned/."""
+        """Run sync_align.py to produce wall-clock-aligned MP4s in ./svo_aligned/.
+
+        Passes --config so the per-cam rotation is applied during alignment."""
         if self.proc and self.proc.poll() is None:
             messagebox.showwarning("Busy", "A command is already running. Wait for it to finish.")
             return
         cmd = [sys.executable, str(HERE / "sync_align.py"),
-               self.local_dir_var.get()]
+               self.local_dir_var.get(),
+               "--config", str(self.config_path)]
         self._log(f"\n$ {' '.join(cmd)}\n")
         self.status_var.set("running: align")
+        threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
+
+    def _convert_local(self):
+        """Run convert_local.py against local-dir. Faster than the remote
+        Jetson conversion when this PC has pyzed + ffmpeg."""
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("Busy", "A command is already running. Wait for it to finish.")
+            return
+        cmd = [sys.executable, str(HERE / "convert_local.py"),
+               self.local_dir_var.get()]
+        self._log(f"\n$ {' '.join(cmd)}\n")
+        self.status_var.set("running: convert local")
+        threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
+
+    def _save_mosaic(self):
+        """Run playback.py in --no-display + --save mode to write the
+        synchronised mosaic to a file alongside the local-dir."""
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("Busy", "A command is already running. Wait for it to finish.")
+            return
+        local = Path(self.local_dir_var.get())
+        out_path = local.parent / f"{local.name}_mosaic.mp4"
+        cmd = [sys.executable, str(HERE / "playback.py"),
+               str(local),
+               "--save", str(out_path),
+               "--no-display"]
+        self._log(f"\n$ {' '.join(cmd)}\n")
+        self.status_var.set("running: save mosaic")
         threading.Thread(target=self._run_thread, args=(cmd,), daemon=True).start()
 
     def _run(self, *subcmd):
@@ -265,9 +327,19 @@ def main():
                    help="Path to fleet config (default: ./config.json)")
     args = p.parse_args()
 
+    print(f"[gui] starting with config={args.config}", flush=True)
     root = tk.Tk()
-    root.geometry("960x720")
+    root.title("ZED Multicam Recorder")
+    root.geometry("960x720+50+50")
+    # Briefly force the window to the front so it doesn't get hidden behind
+    # the terminal under WSLg. Then drop the attribute so the user can place
+    # it normally afterwards.
+    root.attributes("-topmost", True)
+    root.after(500, lambda: root.attributes("-topmost", False))
+    root.lift()
+    root.focus_force()
     App(root, Path(args.config))
+    print("[gui] mainloop started — window should be visible now", flush=True)
     root.mainloop()
 
 

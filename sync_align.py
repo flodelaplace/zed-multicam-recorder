@@ -46,9 +46,11 @@ import numpy as np
 def load_cam(subdir):
     """Returns (cam_dict, error_message). cam_dict is None on error."""
     subdir = Path(subdir)
-    mp4 = next(iter(sorted(subdir.glob("*.mp4"))), None)
-    csv_path = next(iter(sorted(subdir.glob("*.timestamps.csv"))), None)
-    stats_path = next(iter(sorted(subdir.glob("*.stats.json"))), None)
+    # rglob so we tolerate the nested ./svo/<cam>/recordings/* layout that
+    # scp -r produces, in addition to a flat ./svo/<cam>/* layout.
+    mp4 = next(iter(sorted(subdir.rglob("*.mp4"))), None)
+    csv_path = next(iter(sorted(subdir.rglob("*.timestamps.csv"))), None)
+    stats_path = next(iter(sorted(subdir.rglob("*.stats.json"))), None)
     if not (mp4 and csv_path and stats_path):
         miss = [n for p, n in
                 [(mp4, "mp4"), (csv_path, "csv"), (stats_path, "stats.json")]
@@ -100,9 +102,21 @@ def _closest(walls_arr, t_ns):
     return lo
 
 
-def align_cam(cam, grid, gap_thresh_ns, out_dir, fps):
+_ROTATE_CODES = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def align_cam(cam, grid, gap_thresh_ns, out_dir, fps, rotate=0):
     """Resample one cam to the common grid, writing <label>.aligned.mp4
-    and returning the resampling stats dict."""
+    and returning the resampling stats dict.
+
+    rotate: 0 / 90 / 180 / 270 degrees clockwise applied to every frame
+    (and to the synthetic black frame) before writing."""
+    if rotate not in (0, 90, 180, 270):
+        return None, f"invalid rotate={rotate} (must be 0/90/180/270)"
     cap = cv2.VideoCapture(str(cam["mp4_path"]))
     if not cap.isOpened():
         return None, f"cannot open {cam['mp4_path']}"
@@ -110,10 +124,16 @@ def align_cam(cam, grid, gap_thresh_ns, out_dir, fps):
     if not ret:
         cap.release()
         return None, "cannot read first frame"
-    H, W = first.shape[:2]
+    src_H, src_W = first.shape[:2]
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # rewind for sequential reads
     cur_mp4_idx = -1                     # index of last frame read from MP4
     cur_frame = None
+
+    # Rotation swaps width/height for 90/270.
+    if rotate in (90, 270):
+        out_W, out_H = src_H, src_W
+    else:
+        out_W, out_H = src_W, src_H
 
     indices = cam["indices"]
     walls_arr = [cam["walls"][i] for i in indices]
@@ -121,12 +141,12 @@ def align_cam(cam, grid, gap_thresh_ns, out_dir, fps):
     out_path = out_dir / cam["label"] / f"{cam['label']}.aligned.mp4"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(str(out_path), fourcc, float(fps), (W, H))
+    out = cv2.VideoWriter(str(out_path), fourcc, float(fps), (out_W, out_H))
     if not out.isOpened():
         cap.release()
         return None, f"cannot open writer {out_path}"
 
-    black = np.zeros((H, W, 3), dtype=np.uint8)
+    black = np.zeros((out_H, out_W, 3), dtype=np.uint8)
     black_frames = []
 
     for grid_n, T in enumerate(grid):
@@ -156,7 +176,11 @@ def align_cam(cam, grid, gap_thresh_ns, out_dir, fps):
             out.write(black)
             black_frames.append(grid_n)
         else:
-            out.write(cur_frame)
+            if rotate in _ROTATE_CODES:
+                frame_to_write = cv2.rotate(cur_frame, _ROTATE_CODES[rotate])
+            else:
+                frame_to_write = cur_frame
+            out.write(frame_to_write)
 
     cap.release()
     out.release()
@@ -165,8 +189,9 @@ def align_cam(cam, grid, gap_thresh_ns, out_dir, fps):
         "n_frames": len(grid),
         "black_frames": black_frames,
         "black_count": len(black_frames),
-        "width": W,
-        "height": H,
+        "width": out_W,
+        "height": out_H,
+        "rotate": rotate,
     }, None
 
 
@@ -185,7 +210,17 @@ def main():
                    help="Insert a black frame when a cam's nearest frame is more"
                         " than this far from the grid time. "
                         "Default: 0.75 / fps (= 25 ms at 30 fps).")
+    p.add_argument("--config", default=None,
+                   help="Optional path to fleet config JSON. If given, applies "
+                        "per-cam `rotate` (0/90/180/270 deg clockwise) "
+                        "matched by host label.")
     args = p.parse_args()
+
+    rotate_by_label = {}
+    if args.config:
+        cfg = json.loads(Path(args.config).read_text())
+        for h in cfg.get("hosts", []):
+            rotate_by_label[h["label"]] = int(h.get("rotate", 0))
 
     local = Path(args.local_dir)
     if not local.exists():
@@ -238,15 +273,18 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     cam_results = {}
     for cam in cams:
+        rotate = rotate_by_label.get(cam["label"], 0)
         t0 = time.monotonic()
-        res, err = align_cam(cam, grid, gap_thresh_ns, out_dir, args.fps)
+        res, err = align_cam(cam, grid, gap_thresh_ns, out_dir, args.fps,
+                             rotate=rotate)
         dt = time.monotonic() - t0
         if err:
             print(f"    {cam['label']}: ERR {err}", file=sys.stderr)
             continue
         loss_pct = 100 * res["black_count"] / res["n_frames"]
+        rot_s = f", rotated {rotate}°" if rotate else ""
         print(f"    {cam['label']}: {res['n_frames']} frames, "
-              f"{res['black_count']} black ({loss_pct:.3f}%), "
+              f"{res['black_count']} black ({loss_pct:.3f}%){rot_s}, "
               f"took {dt:.1f}s")
         cam_results[cam["label"]] = res
 
@@ -257,6 +295,7 @@ def main():
             "n_frames": res["n_frames"],
             "width": res["width"],
             "height": res["height"],
+            "rotate": rotate,
             "t_start_unix_ns": t_start,
             "t_end_unix_ns": t_end,
             "duration_s": duration_s,

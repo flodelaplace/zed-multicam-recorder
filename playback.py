@@ -42,9 +42,11 @@ import numpy as np
 
 def _load_cam(subdir):
     """Read MP4 + CSV + stats. Returns dict or None if anything is missing."""
-    mp4 = next(iter(sorted(subdir.glob("*.mp4"))), None)
-    csv_path = next(iter(sorted(subdir.glob("*.timestamps.csv"))), None)
-    stats_path = next(iter(sorted(subdir.glob("*.stats.json"))), None)
+    # rglob so we tolerate the nested ./svo/<cam>/recordings/* layout that
+    # scp -r produces, in addition to a flat ./svo/<cam>/* layout.
+    mp4 = next(iter(sorted(subdir.rglob("*.mp4"))), None)
+    csv_path = next(iter(sorted(subdir.rglob("*.timestamps.csv"))), None)
+    stats_path = next(iter(sorted(subdir.rglob("*.stats.json"))), None)
     if not (mp4 and csv_path and stats_path):
         miss = [n for p, n in [(mp4, "mp4"), (csv_path, "csv"), (stats_path, "stats.json")] if not p]
         print(f"  skip {subdir.name}: missing {miss}", file=sys.stderr)
@@ -157,7 +159,13 @@ def main():
                    help="Playback target fps (default: 30)")
     p.add_argument("--scale", type=float, default=0.5,
                    help="Per-cam frame scale factor (default: 0.5)")
+    p.add_argument("--save", default=None,
+                   help="Also write the mosaic to this MP4 path while playing")
+    p.add_argument("--no-display", action="store_true",
+                   help="Skip the cv2 window — useful with --save in batch mode")
     args = p.parse_args()
+    if args.no_display and not args.save:
+        sys.exit("--no-display only makes sense with --save")
 
     local = Path(args.local_dir)
     if not local.exists():
@@ -190,6 +198,7 @@ def main():
     step_ns = int(1e9 / args.fps)
     t = t_start
     paused = False
+    writer = None
 
     while t <= t_end:
         frames = []
@@ -210,10 +219,23 @@ def main():
         cv2.putText(mosaic, f"t = {cur_s:6.3f} s   {len(cams)} cams",
                     (10, mosaic.shape[0] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.imshow("ZED multicam sync playback", mosaic)
 
-        wait_ms = 0 if paused else max(1, int(1000 / args.fps))
-        key = cv2.waitKey(wait_ms) & 0xFF
+        if args.save and writer is None:
+            mh, mw = mosaic.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(args.save, fourcc, float(args.fps), (mw, mh))
+            if not writer.isOpened():
+                sys.exit(f"cannot open writer {args.save}")
+            print(f"[playback] writing mosaic to {args.save}  ({mw}x{mh}@{args.fps})")
+        if writer is not None:
+            writer.write(mosaic)
+
+        if not args.no_display:
+            cv2.imshow("ZED multicam sync playback", mosaic)
+            wait_ms = 0 if paused else max(1, int(1000 / args.fps))
+            key = cv2.waitKey(wait_ms) & 0xFF
+        else:
+            key = 0  # no interaction in batch mode
 
         if key == ord('q'):
             break
@@ -232,6 +254,9 @@ def main():
 
     for c in cams:
         c["cap"].release()
+    if writer is not None:
+        writer.release()
+        print(f"[playback] saved mosaic to {args.save}")
     cv2.destroyAllWindows()
 
 

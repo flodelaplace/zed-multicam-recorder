@@ -13,8 +13,12 @@ __pycache__/
 # Recordings (never commit)
 *.svo
 *.svo2
+*.mp4
 *.timestamps.csv
+*.stats.json
+*.aligned.json
 svo/
+svo_aligned/
 
 # Doctor logs
 doctor_*.log

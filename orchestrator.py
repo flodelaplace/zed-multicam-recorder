@@ -332,13 +332,37 @@ def cmd_record(args, cfg):
     return 0
 
 
+def cmd_stop(args, cfg):
+    """Send STOP to every recorder and print returned stats. Useful to abort
+    a record early without waiting for its --duration to elapse."""
+    hosts = resolve_hosts(args, cfg)
+    print(f"[stop] sending STOP to {len(hosts)} host(s)")
+    stops = parallel(hosts, cfg["port"], {"cmd": "STOP"}, timeout=30)
+    for h in hosts:
+        ip = h["ip"]
+        r = stops.get(ip, {})
+        s = r.get("stats", {})
+        warn = s.get("warning", "")
+        grabbed = s.get("frames_grabbed", "?")
+        fname = s.get("filename", "?")
+        marker = "OK " if r.get("ok") else "ERR"
+        suffix = f" ({warn})" if warn else ""
+        print(f"  {marker}  {ip:15}  {h['label']:20}  grabbed={grabbed}{suffix}")
+        if fname != "?":
+            print(f"                                            {fname}")
+    return 0
+
+
 def cmd_pull(args, cfg):
     hosts = resolve_hosts(args, cfg)
     local = Path(args.local_dir)
     local.mkdir(parents=True, exist_ok=True)
     failures = 0
     for h in hosts:
-        target = f"{h['user']}@{h['ip']}:{cfg['remote_dir']}/"
+        # The trailing /. tells scp to copy the *contents* of remote_dir
+        # rather than remote_dir itself, so we get ./<label>/files.svo
+        # rather than ./<label>/recordings/files.svo.
+        target = f"{h['user']}@{h['ip']}:{cfg['remote_dir']}/."
         dst = local / h["label"].replace("/", "_")
         dst.mkdir(exist_ok=True)
         print(f"[pull] {target} -> {dst}")
@@ -351,65 +375,119 @@ def cmd_pull(args, cfg):
 
 def cmd_analyze(args, cfg):
     """Walk local-dir for *.timestamps.csv and report real fps / real misses
-    based on hw_ts deltas (not the bogus SDK counter)."""
+    based on hw_ts deltas (not the bogus SDK counter).
+
+    Prints two sections:
+      1. Per-cam summary table (events count, estimated missed frames, max gap)
+      2. Per-cam freeze detail (when, how long, how many frames sautées)
+    """
     local = Path(args.local_dir)
     if not local.exists():
         print(f"  {local} does not exist", file=sys.stderr)
         return 1
     rows = []
+    freeze_details = []  # list of (cam_label, [freezes])
     for csv_path in sorted(local.rglob("*.timestamps.csv")):
-        hw_ts = []
-        sdk_drops_last = 0
+        # idx,hw_ts,mono,drop  — keep idx alongside ts for the detail report
+        rec = []
         with open(csv_path) as f:
             f.readline()  # header
             for line in f:
                 parts = line.strip().split(",")
                 if len(parts) != 4:
                     continue
-                idx, ts_s, mono_s, drop_s = parts
-                if idx == "-1":
+                idx_s, ts_s, _, _ = parts
+                if idx_s == "-1":
                     continue
                 try:
+                    idx = int(idx_s)
                     t = int(ts_s)
-                    if t > 0:
-                        hw_ts.append(t)
-                    sdk_drops_last = int(drop_s) if drop_s.isdigit() else sdk_drops_last
                 except ValueError:
                     continue
-        if len(hw_ts) < 2:
+                if t > 0:
+                    rec.append((idx, t))
+        if len(rec) < 2:
             continue
-        intervals_ns = [hw_ts[i + 1] - hw_ts[i] for i in range(len(hw_ts) - 1)]
-        duration_s = (hw_ts[-1] - hw_ts[0]) / 1e9
-        avg_fps = len(hw_ts) / duration_s if duration_s > 0 else 0
-        # Use median interval as a robust "expected" frame period
+
+        first_ts = rec[0][1]
+        intervals_ns = [rec[i + 1][1] - rec[i][1] for i in range(len(rec) - 1)]
+        duration_s = (rec[-1][1] - first_ts) / 1e9
+        avg_fps = len(rec) / duration_s if duration_s > 0 else 0
+        # Median = robust estimate of expected frame period.
         sorted_iv = sorted(intervals_ns)
         median_ns = sorted_iv[len(sorted_iv) // 2]
         threshold_ns = int(median_ns * 1.5)
-        real_misses = sum(1 for d in intervals_ns if d > threshold_ns)
-        max_gap_ms = max(intervals_ns) / 1e6
+
+        # Per-freeze accounting.
+        freezes = []
+        frames_missed_total = 0
+        for i, dt_ns in enumerate(intervals_ns):
+            if dt_ns > threshold_ns:
+                idx_before, ts_before = rec[i]
+                gap_ms = dt_ns / 1e6
+                # Estimated frames skipped : (gap / expected_period) - 1.
+                n_skipped = max(1, int(round(dt_ns / median_ns)) - 1)
+                t_since_start = (ts_before - first_ts) / 1e9
+                freezes.append({
+                    "t_s": round(t_since_start, 2),
+                    "gap_ms": round(gap_ms, 1),
+                    "after_frame": idx_before,
+                    "frames_missed": n_skipped,
+                })
+                frames_missed_total += n_skipped
+
+        expected_frames = int(round(duration_s * (1e9 / median_ns)))
         rows.append({
             "file": str(csv_path.relative_to(local)),
-            "frames": len(hw_ts),
+            "frames": len(rec),
             "duration_s": round(duration_s, 2),
             "avg_fps": round(avg_fps, 2),
-            "real_misses": real_misses,
-            "max_gap_ms": round(max_gap_ms, 1),
-            "loss_pct": round(100 * real_misses / len(intervals_ns), 3) if intervals_ns else 0,
+            "events": len(freezes),
+            "frames_missed": frames_missed_total,
+            "loss_pct": round(100 * frames_missed_total / max(1, expected_frames), 3),
+            "max_gap_ms": round(max(intervals_ns) / 1e6, 1),
         })
+        # Derive a short cam label = the parent dir of the CSV.
+        freeze_details.append((csv_path.parent.name, freezes))
+
     if not rows:
         print(f"No *.timestamps.csv found under {local}")
         return 1
-    cols = ["file", "frames", "duration_s", "avg_fps", "real_misses", "loss_pct", "max_gap_ms"]
+
+    # 1. Summary table.
+    cols = ["file", "frames", "duration_s", "avg_fps",
+            "events", "frames_missed", "loss_pct", "max_gap_ms"]
     widths = {c: max(len(c), max(len(str(r[c])) for r in rows)) for c in cols}
     print("  ".join(c.ljust(widths[c]) for c in cols))
     print("  ".join("-" * widths[c] for c in cols))
     for r in rows:
         print("  ".join(str(r[c]).ljust(widths[c]) for c in cols))
     print()
-    total_misses = sum(r["real_misses"] for r in rows)
-    total_frames = sum(r["frames"] for r in rows)
-    print(f"Total real_misses across all cams : {total_misses} on {total_frames} frames "
-          f"({100 * total_misses / total_frames:.3f}%)")
+
+    total_missed = sum(r["frames_missed"] for r in rows)
+    total_expected = sum(int(round(r["duration_s"] * r["avg_fps"])) for r in rows)
+    print(f"Total frames missed across all cams : {total_missed} on "
+          f"~{total_expected} expected ({100 * total_missed / max(1, total_expected):.3f}%)")
+    print()
+
+    # 2. Freeze detail per cam.
+    any_freeze = any(freezes for _, freezes in freeze_details)
+    if any_freeze:
+        print("Freeze details (where the gaps actually happened):")
+        for cam_label, freezes in freeze_details:
+            if not freezes:
+                print(f"  {cam_label}: 0 freeze")
+                continue
+            total = sum(fz["frames_missed"] for fz in freezes)
+            print(f"  {cam_label}: {len(freezes)} freeze(s), "
+                  f"~{total} frames missed total")
+            for fz in freezes:
+                print(f"      t={fz['t_s']:6.1f}s  "
+                      f"gap={fz['gap_ms']:7.1f}ms  "
+                      f"(~{fz['frames_missed']:3d} frames) "
+                      f"after frame {fz['after_frame']}")
+    else:
+        print("No freezes detected on any cam.")
     return 0
 
 
@@ -587,6 +665,11 @@ def main(argv=None):
 
     sp = sub.add_parser("kill", help="Stop recorders on each host")
     sp.set_defaults(func=cmd_kill)
+
+    sp = sub.add_parser("stop",
+                        help="Send STOP to every recorder (abort an in-progress "
+                             "recording without killing the daemons)")
+    sp.set_defaults(func=cmd_stop)
 
     sp = sub.add_parser("record", help="Synchronously record on all hosts")
     sp.add_argument("--duration", type=float, default=60,

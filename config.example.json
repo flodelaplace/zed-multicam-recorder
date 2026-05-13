@@ -12,10 +12,10 @@
   "default_ssh_user": "zed",
 
   "hosts": [
-    { "ip": "192.168.0.2", "user": "zed1",  "label": "cam_left"  },
-    { "ip": "192.168.0.3", "user": "zed",   "label": "cam_back_left"  },
-    { "ip": "192.168.0.4", "user": "zed",   "label": "cam_back_right" },
-    { "ip": "192.168.0.6", "user": "zed",   "label": "cam_right"  }
+    { "ip": "192.168.0.2", "user": "zed1", "label": "cam_left",       "rotate": 0   },
+    { "ip": "192.168.0.3", "user": "zed",  "label": "cam_back_left",  "rotate": 0   },
+    { "ip": "192.168.0.4", "user": "zed",  "label": "cam_back_right", "rotate": 90  },
+    { "ip": "192.168.0.6", "user": "zed",  "label": "cam_right",      "rotate": 270 }
   ],
 
   "_explanations": {
@@ -26,6 +26,7 @@
     "openblas_armv8": "Set to true for Jetson Nano (Cortex-A57 cannot run modern numpy BLAS dispatch). Set to false on Xavier NX or Orin where it is not needed.",
     "default_ssh_user": "Used when --hosts overrides config, or when a host entry omits 'user'.",
     "hosts.user": "Per-Jetson SSH login. Often differs across machines if they were flashed by different people.",
-    "hosts.label": "Friendly identifier used in output tables and pull subdirectory names. Must be unique across hosts."
+    "hosts.label": "Friendly identifier used in output tables and pull subdirectory names. Must be unique across hosts.",
+    "hosts.rotate": "Optional. Degrees of clockwise rotation applied to the cam's frames when sync_align.py writes the aligned MP4. Use 0 for landscape, 90/180/270 if the camera is physically mounted on its side. Has no effect on the live recorder — it's a post-processing knob applied at alignment time."
   }
 }
