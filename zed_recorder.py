@@ -32,8 +32,10 @@ os.environ.setdefault("OPENBLAS_CORETYPE", "ARMV8")
 
 import argparse
 import datetime as dt
+import glob
 import json
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -59,6 +61,36 @@ else:
         return int(time.monotonic() * 1_000_000_000)
 
 
+# ZED2 = peripherique USB composite : video (2b03:f780) + HID/IMU (2b03:f781).
+# L'interface HID re-enumere periodiquement ("reset full-speed USB device") sur
+# le xHCI du Jetson, ce qui stalle momentanement le flux video (freezes). On
+# n'utilise pas l'IMU : une fois la camera ouverte, on desautorise le HID au
+# niveau USB pour stopper les resets (la video n'est pas affectee). Le HID DOIT
+# etre present pendant Camera.open() (canal de controle) -> on le desactive
+# seulement APRES l'open et on le re-autorise a la fermeture. Requiert sudo sans
+# mot de passe (configure sur la flotte).
+def _find_zed_hid_sysfs():
+    for d in glob.glob("/sys/bus/usb/devices/*/"):
+        try:
+            vid = open(d + "idVendor").read().strip()
+            pid = open(d + "idProduct").read().strip()
+        except IOError:
+            continue
+        if vid == "2b03" and pid == "f781":
+            return d.rstrip("/")
+    return None
+
+
+def _set_hid_authorized(path, val):
+    try:
+        subprocess.run("echo %d | sudo -n tee %s/authorized >/dev/null 2>&1"
+                       % (val, path), shell=True, timeout=5)
+        return True
+    except Exception as e:
+        print("[zed_recorder] HID authorized=%d echec: %s" % (val, e), flush=True)
+        return False
+
+
 # ---------- Recorder ---------- #
 
 class Recorder:
@@ -74,6 +106,7 @@ class Recorder:
         self.zed = None  # type: Optional[sl.Camera]
         self.state = "idle"   # idle | opening | recording | stopping
         self.current = {}  # type: dict
+        self._hid_path = None  # chemin sysfs du HID ZED2 desactive pendant la capture
 
     # -- camera open helper ---------------------------------------------------
     def _open_camera(self) -> sl.Camera:
@@ -83,25 +116,67 @@ class Recorder:
         init.camera_fps = self.fps
         init.depth_mode = sl.DEPTH_MODE.NONE          # RGB-only, no depth compute
         init.coordinate_units = sl.UNIT.MILLIMETER
+        # On n'utilise pas l'IMU -> ne pas exiger les capteurs (permet aussi de
+        # desactiver le HID une fois ouvert sans casser la capture).
+        init.sensors_required = False
         # Reduce memory and CPU pressure to maximise grab loop reliability
         init.sdk_verbose = 0
-        err = zed.open(init)
-        if err != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Camera.open() failed: {err}")
-        return zed
+        # Some ZED2 units intermittently fail the first open() with
+        # CAMERA STREAM FAILED TO START (USB2/IMU re-enumeration on a marginal
+        # cable or port). The video stream is perfectly stable once opened, so
+        # we just retry a few times rather than aborting the whole recording.
+        # S'assurer que le HID/IMU est ACTIVE avant l'open. Une session precedente
+        # tuee pendant la capture (kill, restart systemd, crash) peut l'avoir laisse
+        # desautorise (authorized=0) ; Camera.open() echoue alors en boucle avec
+        # "CAMERA MOTION SENSORS NOT DETECTED". On le reactive systematiquement ici
+        # pour un open fiable quel que soit l'etat laisse par la fois d'avant.
+        hid0 = _find_zed_hid_sysfs()
+        if hid0 and _set_hid_authorized(hid0, 1):
+            time.sleep(1.0)   # laisse le HID re-enumerer avant le 1er open
+        max_attempts, retry_delay_s = 5, 2.0
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            err = zed.open(init)
+            if err == sl.ERROR_CODE.SUCCESS:
+                if attempt > 1:
+                    print("Camera.open() succeeded on attempt %d/%d"
+                          % (attempt, max_attempts), flush=True)
+                # HID present a l'open : on le desactive maintenant pour couper
+                # les resets USB periodiques (source des freezes video).
+                self._hid_path = _find_zed_hid_sysfs()
+                if self._hid_path and _set_hid_authorized(self._hid_path, 0):
+                    print("HID/IMU ZED2 desactive (%s) — resets USB stoppes"
+                          % self._hid_path, flush=True)
+                return zed
+            last_err = err
+            print("Camera.open() attempt %d/%d failed: %s"
+                  % (attempt, max_attempts, err), flush=True)
+            time.sleep(retry_delay_s)
+        raise RuntimeError("Camera.open() failed after %d attempts: %s"
+                           % (max_attempts, last_err))
 
     # -- public API -----------------------------------------------------------
-    def start(self, duration_s: float, label: str) -> dict:
+    def start(self, duration_s: float, label: str, take_id=None,
+              resolution=None, fps=None) -> dict:
         with self._lock:
             if self.state != "idle":
                 raise RuntimeError(f"Cannot START: state={self.state}")
             self.state = "opening"
+            # override reso/fps pour CET enregistrement (choisi depuis le dashboard)
+            if resolution and getattr(sl.RESOLUTION, str(resolution), None) is not None:
+                self.resolution = str(resolution)
+            if fps:
+                self.fps = int(fps)
 
         try:
             zed = self._open_camera()
             info = zed.get_camera_information()
             serial = info.serial_number
-            ts = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+            # take_id partage par toutes les cams d'une meme prise (genere une fois
+            # par le PC au START) -> les fichiers d'une prise partagent le meme suffixe,
+            # ce qui rend le groupement/extraction/stats par prise triviaux. A defaut
+            # (appel direct sans take_id), on retombe sur l'horodatage local.
+            ts = take_id or dt.datetime.now().strftime("%Y%m%dT%H%M%S")
             base = f"{label}_{serial}_{ts}"
             # SDK 3.x uses .svo (SVO v1). The .svo2 format is SDK 4.x+.
             svo_path = self.output_dir / f"{base}.svo"
@@ -232,6 +307,11 @@ class Recorder:
             except Exception:
                 pass
             self.zed = None
+        # Re-autorise le HID/IMU pour que le prochain Camera.open() refonctionne
+        # (le HID doit etre present a l'ouverture).
+        if self._hid_path:
+            _set_hid_authorized(self._hid_path, 1)
+            self._hid_path = None
         self.current["end_unix_ns"] = _time_ns()
         # Persist stats next to the SVO so post-processing tools (analyze,
         # playback) can read first_frame_unix_ns, the per-cam camera_open
@@ -246,6 +326,47 @@ class Recorder:
                   flush=True)
         with self._lock:
             self.state = "idle"
+
+    def grab_preview(self, width=384, height=216) -> dict:
+        """Ouvre la cam, capture UNE image gauche reduite -> JPEG base64.
+        Utilise Mat.write() du SDK (pas de dependance cv2). Refuse si occupe."""
+        import base64
+        with self._lock:
+            if self.state != "idle":
+                return {"ok": False, "error": "occupe (%s)" % self.state}
+            self.state = "opening"
+        zed = None
+        hid = None
+        try:
+            zed = self._open_camera()          # reauth HID avant, desactive HID apres
+            hid = self._hid_path
+            serial = zed.get_camera_information().serial_number
+            img = sl.Mat()
+            got = False
+            for _ in range(10):
+                if zed.grab() == sl.ERROR_CODE.SUCCESS:
+                    zed.retrieve_image(img, sl.VIEW.LEFT, sl.MEM.CPU,
+                                       sl.Resolution(int(width), int(height)))
+                    got = True
+            jpg = None
+            path = "/tmp/zed_preview.jpg"
+            if got and img.write(path) == sl.ERROR_CODE.SUCCESS:
+                with open(path, "rb") as f:
+                    jpg = base64.b64encode(f.read()).decode("ascii")
+            return {"ok": bool(jpg), "jpg": jpg, "serial": int(serial)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        finally:
+            if zed is not None:
+                try:
+                    zed.close()
+                except Exception:
+                    pass
+            if hid:
+                _set_hid_authorized(hid, 1)
+                self._hid_path = None
+            with self._lock:
+                self.state = "idle"
 
 
 # ---------- TCP server ---------- #
@@ -265,10 +386,16 @@ def _dispatch(msg: dict, recorder: Recorder) -> dict:
         info = recorder.start(
             duration_s=float(msg.get("duration_s", 3600)),
             label=str(msg.get("label", "test")),
+            take_id=(str(msg["take_id"]) if msg.get("take_id") else None),
+            resolution=(str(msg["resolution"]) if msg.get("resolution") else None),
+            fps=(int(msg["fps"]) if msg.get("fps") else None),
         )
         return {"ok": True, **info}
     if cmd == "STOP":
         return {"ok": True, "stats": recorder.stop()}
+    if cmd == "GRAB":
+        return recorder.grab_preview(
+            width=int(msg.get("width", 384)), height=int(msg.get("height", 216)))
     return {"ok": False, "error": f"unknown cmd: {cmd!r}"}
 
 

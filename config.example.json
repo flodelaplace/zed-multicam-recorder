@@ -4,12 +4,22 @@
   "port": 9999,
   "remote_dir": "/tmp/recordings",
 
-  "default_resolution": "HD1080",
+  "default_resolution": "HD720",
   "default_fps": 30,
 
   "openblas_armv8": true,
 
   "default_ssh_user": "zed",
+
+  "calibration": {
+    "repo": "/home/<user>/extrinsic-camera-calibration/lab-camera-dynamic-calibrator",
+    "conda_env": "human_calib",
+    "script": "scripts/calibrate.sh",
+    "device": "cuda",
+    "mode": "balanced",
+    "pose_engine": "metrabs",
+    "frame_skip": 5
+  },
 
   "hosts": [
     { "ip": "192.168.0.2", "user": "zed1", "label": "cam_left",       "rotate": 0   },
@@ -21,7 +31,9 @@
   "_explanations": {
     "port": "TCP port that each recorder listens on. Must match zed_recorder.py --port.",
     "remote_dir": "Path on each Jetson where SVOs and sidecar CSVs land. Must be writable by the SSH user. /tmp is fine for tests but cleared on reboot — use /home/<user>/recordings or an SSD mount for production.",
-    "default_resolution": "ZED2 supports HD2K (15 fps max), HD1080 (30 fps), HD720 (60 fps), VGA (100 fps).",
+    "default_resolution": "ZED2 supports HD2K (15 fps max), HD1080 (30 fps), HD720 (60 fps), VGA (100 fps). HD720@30 is the validated setting on a 12-cam fleet (HD1080 has a periodic-drop SDK bug, HD720@60 drops ~13%).",
+    "calibration": "Extrinsic calibration launched from the web dashboard on synced MP4s (essai_<N>/raw_mp4/). Points to an external repo run through 'conda run -n <conda_env>'. Optional 'conda_bin' (default ~/miniconda3/bin/conda).",
+    "hosts.serial": "Optional. ZED2 serial number of the camera plugged into this host (used to read /usr/local/zed/settings/SN<serial>.conf intrinsics).",
     "default_fps": "Capped by the resolution choice above.",
     "openblas_armv8": "Set to true for Jetson Nano (Cortex-A57 cannot run modern numpy BLAS dispatch). Set to false on Xavier NX or Orin where it is not needed.",
     "default_ssh_user": "Used when --hosts overrides config, or when a host entry omits 'user'.",

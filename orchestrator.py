@@ -106,7 +106,12 @@ def parallel(hosts, port, msg, timeout=5.0):
 # ---------- SSH helpers ---------- #
 
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-            "-o", "StrictHostKeyChecking=accept-new"]
+            "-o", "StrictHostKeyChecking=accept-new",
+            # multiplexing : la 1re connexion ouvre un socket persistant, les suivantes
+            # le reutilisent (plus de handshake) -> pre-check quasi instantane sur 12 hotes
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=~/.ssh/cm-%C",
+            "-o", "ControlPersist=180"]
 
 
 def ssh_run(host, remote_cmd, capture=False):

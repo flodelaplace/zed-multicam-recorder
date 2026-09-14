@@ -140,8 +140,12 @@ def align_cam(cam, grid, gap_thresh_ns, out_dir, fps, rotate=0):
 
     out_path = out_dir / cam["label"] / f"{cam['label']}.aligned.mp4"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(str(out_path), fourcc, float(fps), (out_W, out_H))
+    # H.264 de preference (meilleure qualite/taille pour le dataset) ; repli mp4v.
+    out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"avc1"),
+                          float(fps), (out_W, out_H))
+    if not out.isOpened():
+        out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                              float(fps), (out_W, out_H))
     if not out.isOpened():
         cap.release()
         return None, f"cannot open writer {out_path}"

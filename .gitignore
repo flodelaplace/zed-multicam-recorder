@@ -28,6 +28,13 @@ artifacts/
 
 # Site-specific fleet config (keep config.example.json)
 config.json
+config.json.bak*
+
+# Patient data + encrypted registry, camera snapshots (never commit)
+data/
+views/
+audit_*.txt
+scratchpad/
 
 # OS junk
 .DS_Store
